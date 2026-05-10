@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
@@ -44,6 +45,118 @@ def _split_checklist_items(raw: str | None) -> list[str]:
     if not raw:
         return []
     return [p.strip() for p in re.split(r"[\n;|]+", raw) if p.strip()]
+
+
+def _normalize_guillemets_for_inference(text: str) -> str:
+    """Whisper/Телеграм иногда отдают „..." или Unicode-кавычки вместо «…»."""
+    if not text:
+        return text
+    s = text
+    for src, dst in (
+        ("\u201c", "«"),
+        ("\u201d", "»"),
+        ("\u201e", "«"),
+        ("\u00ab", "«"),
+        ("\u00bb", "»"),
+        ("\u2039", "«"),
+        ("\u203a", "»"),
+    ):
+        s = s.replace(src, dst)
+    return s
+
+
+def _infer_card_title_from_user_text(text: str) -> str | None:
+    """Вытаскивает название карточки из разговорной фразы («…», «называется …»)."""
+    s = _normalize_guillemets_for_inference((text or "").strip())
+    if not s:
+        return None
+    patterns = (
+        r"называется\s*«([^»]+)»",
+        r"называется\s*\"([^\"]+)\"",
+        r"к\s+карточк[аеу]\s*«([^»]+)»",
+        r"в\s+задач[аеу]\s*«([^»]+)»",
+        r"задач[аеиу]\s*,?\s*которая\s+называется\s*«([^»]+)»",
+    )
+    for pat in patterns:
+        m = re.search(pat, s, flags=re.IGNORECASE)
+        if m:
+            t = m.group(1).strip()
+            if len(t) >= 2:
+                return t
+    m = re.search(r"«([^»]{2,120})»", s)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+_RU_INDEX_WORDS: dict[str, int] = {
+    "один": 1, "одну": 1, "одна": 1, "одно": 1, "одного": 1,
+    "первый": 1, "первая": 1, "первое": 1, "первую": 1, "первого": 1, "первой": 1,
+    "два": 2, "две": 2, "двух": 2, "двое": 2,
+    "второй": 2, "вторая": 2, "второе": 2, "вторую": 2, "второго": 2,
+    "три": 3, "трёх": 3, "трех": 3, "трое": 3,
+    "третий": 3, "третья": 3, "третье": 3, "третью": 3, "третьего": 3, "третьей": 3,
+    "четыре": 4, "четырёх": 4, "четырех": 4,
+    "четвертый": 4, "четвёртый": 4, "четвертая": 4, "четвёртая": 4,
+    "четвертое": 4, "четвёртое": 4, "четвертую": 4, "четвёртую": 4,
+    "пять": 5, "пятый": 5, "пятая": 5, "пятое": 5, "пятую": 5,
+    "шесть": 6, "шестой": 6, "шестая": 6, "шестое": 6, "шестую": 6,
+    "семь": 7, "седьмой": 7, "седьмая": 7, "седьмое": 7, "седьмую": 7,
+    "восемь": 8, "восьмой": 8, "восьмая": 8, "восьмое": 8, "восьмую": 8,
+    "девять": 9, "девятый": 9, "девятая": 9, "девятое": 9, "девятую": 9,
+    "десять": 10, "десятый": 10, "десятая": 10, "десятое": 10, "десятую": 10,
+}
+
+
+def _extract_index_from_reply(reply: str, max_idx: int) -> int | None:
+    """Понимает «1», «номер 2», «под номером один», «выбираю первую» и т.п."""
+    if max_idx <= 0:
+        return None
+    s = (reply or "").strip().lower().replace("ё", "е")
+    if not s:
+        return None
+    m = re.search(r"\b(\d{1,2})\b", s)
+    if m:
+        idx = int(m.group(1))
+        if 1 <= idx <= max_idx:
+            return idx
+    for token in re.findall(r"[а-яa-z]+", s):
+        normalized = token.replace("ё", "е")
+        idx = _RU_INDEX_WORDS.get(normalized)
+        if idx is not None and 1 <= idx <= max_idx:
+            return idx
+    return None
+
+
+def _checklist_add_card_search_queries(user_text: str, action: AgentAction) -> list[str]:
+    """Запросы для поиска карточки при добавлении в чеклист.
+
+    Явное «название в кавычках» в реплике надёжнее поля card_name от LLM: модель часто
+    кладёт туда предметы чеклиста («английский», «география»), из‑за чего fuzzy не находит карточку.
+    """
+    ut = (user_text or "").strip()
+    inferred = _infer_card_title_from_user_text(ut)
+    cn = (action.card_name or "").strip()
+    out: list[str] = []
+    seen_lower: set[str] = set()
+
+    def push(q: str) -> None:
+        q = q.strip()
+        if len(q) < 2:
+            return
+        low = q.lower()
+        if low in seen_lower:
+            return
+        seen_lower.add(low)
+        out.append(q)
+
+    if inferred:
+        push(inferred)
+    if cn:
+        push(cn)
+    if ut and len(ut) <= 800:
+        push(ut)
+    return out
 
 
 class TaskOrchestrator:
@@ -138,11 +251,19 @@ class TaskOrchestrator:
                     "metadata": {**base_meta, **payload},
                 }
             )
+        extra = ""
+        if action.card_name:
+            extra = (
+                f"Не нашёл на доске карточку по названию «{action.card_name}». "
+                "Пришлите ссылку на карточку "
+            )
+        else:
+            extra = "Чтобы добавить пункты в чеклист, нужна карточка в Trello. Пришлите ссылку на карточку "
         return action.model_copy(
             update={
                 "action_type": "ask_for_clarification",
                 "question": (
-                    "Чтобы добавить пункты в чеклист, нужна карточка в Trello. Пришлите ссылку на карточку "
+                    f"{extra}"
                     "(https://trello.com/c/…) или id карточки (24 символа из URL)."
                 ),
                 "metadata": {**base_meta, **payload},
@@ -160,8 +281,8 @@ class TaskOrchestrator:
             f"Название чеклиста (если было): {cl_name}\n"
             f"Пункты чеклиста: {items}\n"
             f"Пользователь указал карточку или уточнение: {clarification_reply}\n"
-            "Верни JSON: если из текста однозначно следует card_id (24 символа или из ссылки trello.com/c/shortlink) — "
-            "create_checklist_item с этим card_id и тем же checklist_item. Если id не ясен — ask_for_clarification."
+            "Верни JSON create_checklist_item: card_id если есть ссылка/id; иначе card_name — название карточки для поиска; "
+            "сохрани checklist_item. Если ничего не ясно — ask_for_clarification."
         )
 
     @staticmethod
@@ -180,6 +301,78 @@ class TaskOrchestrator:
             f"Ответ пользователя на уточнение: {clarification_reply}\n"
             "Верни JSON для create_card: подставь недостающее (card_name и/или due в ISO 8601), "
             "сохрани прежние значения, не выдумывай новые подзадачи. Если срок всё ещё не ясен — ask_for_clarification."
+        )
+
+    async def _resolve_add_checklist_card(
+        self,
+        profile: UserProfile,
+        user_text: str,
+        action: AgentAction,
+    ) -> tuple[AgentAction, str | None]:
+        """Если пытаемся добавить пункты в чеклист без card_id — ищем карточку по названию на доске."""
+        if action.action_type != "create_checklist_item":
+            return action, None
+        if action.card_id or not (action.checklist_item or "").strip():
+            return action, None
+        if not profile.trello_board_id:
+            return action, None
+
+        queries = _checklist_add_card_search_queries(user_text, action)
+        if not queries:
+            return action, None
+
+        lists_raw = await self.trello_client.list_lists(profile.trello_board_id)
+        payload = await self.trello_client.list_board_cards_with_checklists(profile.trello_board_id)
+        payload = drop_cards_in_archived_lists(payload, lists_raw)
+        cards = cards_from_payload(payload)
+        # Не отбрасываем колонку «Готово»: пользователь может ссылаться на карточку там,
+        # и пункты чеклиста всё равно имеет смысл добавить.
+
+        hits: list[CardSearchHit] = []
+        q_used = queries[0]
+        for q in queries:
+            hits = await self._search_cards_hybrid(profile, q, cards)
+            if hits:
+                q_used = q
+                break
+        if not hits:
+            logger.info("add_checklist: no card hits after queries=%r", queries)
+            return action, None
+
+        winner = confident_unique_hit(hits)
+        if winner is not None:
+            ref = next((c for c in cards if c.card_id == winner.card_id), None)
+            if ref is not None:
+                logger.info(
+                    "add_checklist: unique match card_id=%s name=%r",
+                    ref.card_id,
+                    ref.card_name,
+                )
+                return action.model_copy(update={"card_id": ref.card_id}), None
+
+        cands: list[dict[str, str]] = [
+            {"card_id": h.card_id, "card_name": h.card_name} for h in hits[:5]
+        ]
+        listing = "\n".join(f"{i + 1}) {c['card_name']}" for i, c in enumerate(cands))
+        question = (
+            f"Нашёл несколько карточек по запросу «{q_used}». "
+            f"В какую добавить пункты чеклиста? Укажите номер:\n{listing}"
+        )
+        return (
+            action.model_copy(
+                update={
+                    "action_type": "ask_for_clarification",
+                    "question": question,
+                    "metadata": {
+                        **(action.metadata or {}),
+                        "after_clarification": "add_checklist_pick_card",
+                        "pending_checklist_item": action.checklist_item,
+                        "pending_checklist_name": action.checklist_name or "Шаги",
+                        "candidates": cands,
+                    },
+                }
+            ),
+            None,
         )
 
     async def _resolve_complete_task(
@@ -285,6 +478,26 @@ class TaskOrchestrator:
             ),
             None,
         )
+
+    async def _complete_all_incomplete_checklist_items(self, card_id: str) -> int:
+        """Отмечает все незавершённые пункты чеклистов карточки как выполненные. Возвращает число обновлённых пунктов."""
+        checklists = await self.trello_client.list_card_checklists(card_id)
+        n = 0
+        for cl in checklists:
+            cid = str(cl.get("id") or "")
+            if not cid:
+                continue
+            for ci in cl.get("checkItems") or []:
+                if (ci.get("state") or "incomplete") == "complete":
+                    continue
+                iid = str(ci.get("id") or "")
+                if not iid:
+                    continue
+                await self.trello_client.update_check_item_on_card(
+                    card_id, cid, iid, complete=True,
+                )
+                n += 1
+        return n
 
     async def _resolve_complete_card(
         self,
@@ -484,9 +697,15 @@ class TaskOrchestrator:
         )
         action = self._apply_due_fallback(user_text, action)
         action = self._ensure_create_card_complete(user_text, action)
-        action = self._ensure_checklist_has_card_or_ask(user_text, action)
 
         success_text: str | None = None
+        if action.action_type == "create_checklist_item" and action.checklist_item and not action.card_id:
+            action, st = await self._resolve_add_checklist_card(profile, user_text, action)
+            if st:
+                success_text = st
+
+        action = self._ensure_checklist_has_card_or_ask(user_text, action)
+
         if action.action_type == "complete_task_from_text":
             action, success_text = await self._resolve_complete_task(profile, user_text, action)
         elif action.action_type == "complete_card_by_text":
@@ -523,12 +742,9 @@ class TaskOrchestrator:
         s = (reply or "").strip().lower()
         if not s:
             return None
-        m = re.search(r"\b(\d{1,2})\b", s)
-        if m:
-            idx = int(m.group(1))
-            if 1 <= idx <= len(candidates):
-                return candidates[idx - 1]
-        # Попробуем по подстроке имени пункта.
+        idx = _extract_index_from_reply(s, len(candidates))
+        if idx is not None:
+            return candidates[idx - 1]
         ranked = sorted(
             candidates,
             key=lambda c: SequenceMatcher(None, s, str(c.get("item_name", "")).lower()).ratio(),
@@ -543,17 +759,15 @@ class TaskOrchestrator:
         candidates: list[dict[str, object]],
         reply: str,
     ) -> dict[str, object] | None:
-        """Парсим выбор: «1», «2», «обслуживание машины» → одна карточка."""
+        """Парсим выбор: «1», «второй», «один», «под номером один» → одна карточка."""
         if not candidates:
             return None
         s = (reply or "").strip().lower()
         if not s:
             return None
-        m = re.search(r"\b(\d{1,2})\b", s)
-        if m:
-            idx = int(m.group(1))
-            if 1 <= idx <= len(candidates):
-                return candidates[idx - 1]
+        idx = _extract_index_from_reply(s, len(candidates))
+        if idx is not None:
+            return candidates[idx - 1]
         ranked = sorted(
             candidates,
             key=lambda c: SequenceMatcher(None, s, str(c.get("card_name", "")).lower()).ratio(),
@@ -576,22 +790,45 @@ class TaskOrchestrator:
         # Короткие ответы — это с большой вероятностью реакция на уточнение.
         if len(s) <= 3:
             return False
+        # Явный выбор пункта/номера — это ответ на уточнение, а не новая команда.
+        if re.search(r"\bномер\w*\s+\w+", s):
+            return False
+        if _extract_index_from_reply(s, 99) is not None:
+            return False
         markers = (
-            "постав", "задач", "создай", "запланир", "напомни", "не забы",
+            "постав", "создай", "запланир", "напомни", "не забы",
             "закрой", "удали", "сотри", "перенес", "обнови", "переименуй",
-            "добавь", "новая", "новую", "новое", "сделай задач",
+            "новая задач", "новую задач", "новое задание",
+            "сделай задач",
         )
         return any(m in s for m in markers)
 
     @staticmethod
     def _parse_yes_no(reply: str) -> bool | None:
         """Парсим да/нет в свободной форме."""
-        s = (reply or "").strip().lower()
+        raw = (reply or "").strip()
+        raw = raw.replace("\ufeff", "").replace("\u200b", "").strip()
+        s = unicodedata.normalize("NFC", raw).lower()
         if not s:
             return None
-        yes_tokens = {"да", "ага", "угу", "конечно", "yes", "y", "ок", "окей", "go", "давай", "переводи", "+"}
-        no_tokens = {"нет", "не", "нельзя", "no", "n", "стоп", "отмена", "-"}
-        first = re.split(r"[\s,.!?]+", s)[0]
+        # Whisper иногда даёт латиницу "Da" вместо «да»
+        yes_tokens = {
+            "да",
+            "ага",
+            "угу",
+            "конечно",
+            "yes",
+            "y",
+            "da",
+            "ок",
+            "окей",
+            "go",
+            "давай",
+            "переводи",
+            "+",
+        }
+        no_tokens = {"нет", "не", "нельзя", "no", "n", "net", "стоп", "отмена", "-"}
+        first = re.split(r"[\s,.!?;:]+", s)[0]
         if first in yes_tokens:
             return True
         if first in no_tokens:
@@ -601,6 +838,21 @@ class TaskOrchestrator:
         if any(t in s for t in ("не перевод", "не закры", "сначала отмеч")):
             return False
         return None
+
+    @staticmethod
+    def _implies_complete_card_force_yes(reply: str) -> bool:
+        """Ответ не начинается с «да», но по смыслу подтверждает закрытие / сообщает о сделанном пункте (голос)."""
+        s = unicodedata.normalize("NFC", (reply or "").strip().lower())
+        if not s:
+            return False
+        # Уже выполнили то, что висело в чеклисте (частый голосовой ответ).
+        if "лобов" in s and "помы" in s:
+            return True
+        if "стекло" in s and "помы" in s:
+            return True
+        if any(t in s for t in ("всё равно закрыв", "все равно закрыв", "закрывай", "переводи в заверш")):
+            return True
+        return False
 
     async def process_text(self, profile: UserProfile, text: str) -> OrchestratorResult:
         pending = await self.clarification_repo.get(profile.telegram_user_id)
@@ -621,6 +873,28 @@ class TaskOrchestrator:
                     forced_intent="add_checklist_items",
                 )
                 return await self._finish_turn(profile, resume, result)
+
+            if after == "add_checklist_pick_card":
+                candidates = list(meta.get("candidates") or [])
+                if candidates and not self._looks_like_new_command(text):
+                    chosen = self._pick_complete_card_candidate(candidates, text)
+                    if chosen is not None:
+                        action = AgentAction(
+                            action_type="create_checklist_item",
+                            card_id=str(chosen.get("card_id")),
+                            checklist_name=str(meta.get("pending_checklist_name") or "Шаги"),
+                            checklist_item=str(meta.get("pending_checklist_item") or ""),
+                        )
+                        await self._execute_action(profile, action)
+                        return OrchestratorResult(
+                            f"Добавил пункты в карточку «{chosen.get('card_name')}».",
+                        )
+                logger.info(
+                    "add_checklist_pick_card pending dropped, routing as fresh input. text=%r",
+                    text,
+                )
+                result = await self.agent_service.infer_action(text=text, persona=profile.persona.value)
+                return await self._finish_turn(profile, text, result)
 
             if after == "create_card":
                 resume = self._create_card_resume_prompt(meta, text)
@@ -695,14 +969,20 @@ class TaskOrchestrator:
 
             if after == "complete_card_force":
                 ans = self._parse_yes_no(text)
+                if ans is None:
+                    ans = True if self._implies_complete_card_force_yes(text) else None
                 card_id = str(meta.get("card_id") or "")
                 card_name = str(meta.get("card_name") or "")
                 if ans is True and card_id:
+                    n_done = await self._complete_all_incomplete_checklist_items(card_id)
                     action = AgentAction(action_type="move_card", card_id=card_id, list_name="done")
                     await self._execute_action(profile, action)
-                    return OrchestratorResult(
-                        f"Перевёл карточку «{card_name}» в «Завершённые», часть пунктов осталась невыполненной.",
-                    )
+                    if n_done:
+                        return OrchestratorResult(
+                            f"Отметил выполненными пунктов чеклиста: {n_done}. "
+                            f"Перевёл карточку «{card_name}» в «Завершённые».",
+                        )
+                    return OrchestratorResult(f"Перевёл карточку «{card_name}» в «Завершённые».")
                 if ans is False:
                     return OrchestratorResult(
                         "Хорошо, не переводил. Сначала отметьте оставшиеся пункты выполненными "

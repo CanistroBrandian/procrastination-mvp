@@ -50,6 +50,14 @@ class FakeTrello:
         self._next_card_id = 100
         self._next_checklist_id = 200
 
+    async def list_lists(self, board_id: str):
+        self.calls.append(("list_lists", {"board_id": board_id}))
+        return []
+
+    async def list_board_cards_with_checklists(self, board_id: str):
+        self.calls.append(("list_board_cards_with_checklists", {"board_id": board_id}))
+        return []
+
     async def create_card(self, list_id, name, desc="", **kw):
         self._next_card_id += 1
         self.calls.append(("create_card", {"list_id": list_id, "name": name, "desc": desc, **kw}))
@@ -243,4 +251,5 @@ def test_pure_checklist_request_without_card_id_asks_for_card():
 
     out = _run(orch.process_text(profile, "добавь пункты в чеклист"))
     assert "карточк" in out.text.lower()
-    assert trello.calls == []
+    methods = [c[0] for c in trello.calls]
+    assert methods == ["list_lists", "list_board_cards_with_checklists"]

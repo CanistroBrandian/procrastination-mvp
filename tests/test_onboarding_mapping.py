@@ -34,7 +34,22 @@ def test_match_inbox(name, expected):
         ("Incomplete", False),
         ("Не завершено", False),
         ("Backlog", False),
+        # Раньше «release» в названии + «backlog» давали ложный done и скрывали бэклог в /cards.
+        ("Product Release Backlog", False),
+        ("Sprint Release Backlog", False),
+        ("Release / Done", True),
     ],
 )
 def test_match_done(name, expected):
     assert _match_done(name) is expected
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("Беклог", True),
+        ("беклог без ё", True),
+    ],
+)
+def test_match_inbox_beklog_variant(name, expected):
+    assert _match_inbox(name) is expected

@@ -16,6 +16,7 @@ def _match_inbox(name: str) -> bool:
         "to do",
         "backlog",
         "бэклог",
+        "беклог",
         "инбокс",
         "надо сделать",
         "к выполнению",
@@ -47,6 +48,11 @@ def _match_done(name: str) -> bool:
         return False
     # не путаем с «incomplete» / «не завершено»
     if "incomplete" in n or "не заверш" in n:
+        return False
+    # Колонка inbox/backlog не может быть «завершённой»: иначе совпадения вроде
+    # «Product Release Backlog» дают и backlog, и маркер release → done_id = id бэклога,
+    # и /cards скрывает весь столбец.
+    if _match_inbox(name):
         return False
     markers = (
         "done",

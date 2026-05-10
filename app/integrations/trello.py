@@ -126,6 +126,29 @@ class TrelloClient:
             },
         )
 
+    async def get_card_with_checklists(self, card_id: str) -> dict[str, Any]:
+        """Одна карточка с полными чеклистами и пунктами (для массового завершения пунктов)."""
+        return await self._request(
+            "GET",
+            f"/cards/{card_id}",
+            {
+                "checklists": "all",
+                "checklist_fields": "all",
+                "fields": "name,idList,closed,shortUrl",
+            },
+        )
+
+    async def list_card_checklists(self, card_id: str) -> list[dict[str, Any]]:
+        """Чеклисты карточки с пунктами — надёжнее, чем вложение в GET /cards/{id} (Trello не всегда отдаёт checkItems)."""
+        return await self._request(
+            "GET",
+            f"/cards/{card_id}/checklists",
+            {
+                "checkItems": "all",
+                "checkItem_fields": "all",
+            },
+        )
+
     async def create_card(
         self,
         list_id: str,
