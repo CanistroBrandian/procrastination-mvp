@@ -202,6 +202,80 @@ def test_zombie_complete_card_pending_is_dropped_for_new_command():
     assert profile.telegram_user_id not in repo.store
 
 
+def test_zombie_create_card_pending_is_dropped_for_explicit_new_command():
+    """Если ждали уточнение для create_card, но пользователь дал новую команду — не форсим старый intent."""
+    profile = FakeProfile()
+    repo = FakeClarificationRepo()
+    _set_pending(
+        repo,
+        profile,
+        {
+            "action_type": "ask_for_clarification",
+            "metadata": {
+                "after_clarification": "create_card",
+                "missing_fields": ["due"],
+                "original_user_text": "поставь задачу помыть машину",
+                "draft_card_name": "Помыть машину",
+            },
+        },
+    )
+
+    agent = FakeAgent(
+        [
+            AgentResult(
+                action=AgentAction(action_type="none"),
+                response_text="Роутер принял новую команду.",
+            ),
+        ],
+    )
+    trello = FakeTrello()
+    orch = TaskOrchestrator(agent_service=agent, trello_client=trello, clarification_repo=repo)
+
+    out = _run(orch.process_text(profile, "Закрой карточку обслуживание машины"))
+
+    assert out.text == "Роутер принял новую команду."
+    assert agent.received_texts == ["Закрой карточку обслуживание машины"]
+    assert agent.received_intents == [None]
+    assert profile.telegram_user_id not in repo.store
+
+
+def test_zombie_create_checklist_pending_is_dropped_for_explicit_new_command():
+    """Если ждали уточнение карточки для checklist, но пришла новая команда — идем в fresh routing."""
+    profile = FakeProfile()
+    repo = FakeClarificationRepo()
+    _set_pending(
+        repo,
+        profile,
+        {
+            "action_type": "ask_for_clarification",
+            "metadata": {
+                "after_clarification": "create_checklist_item",
+                "original_user_text": "добавь пункты в чеклист",
+                "pending_checklist_name": "Шаги",
+                "pending_checklist_item": "Английский; Русский",
+            },
+        },
+    )
+
+    agent = FakeAgent(
+        [
+            AgentResult(
+                action=AgentAction(action_type="none"),
+                response_text="Новая команда обработана отдельно.",
+            ),
+        ],
+    )
+    trello = FakeTrello()
+    orch = TaskOrchestrator(agent_service=agent, trello_client=trello, clarification_repo=repo)
+
+    out = _run(orch.process_text(profile, "Поставь задачу купить хлеб"))
+
+    assert out.text == "Новая команда обработана отдельно."
+    assert agent.received_texts == ["Поставь задачу купить хлеб"]
+    assert agent.received_intents == [None]
+    assert profile.telegram_user_id not in repo.store
+
+
 def test_complete_task_with_candidates_still_resolves_short_reply():
     """Если есть candidates и пользователь пишет короткий ответ ('1'), pending всё ещё работает."""
     profile = FakeProfile()

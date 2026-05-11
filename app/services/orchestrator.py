@@ -33,6 +33,7 @@ from app.services.checklist_match import (
     flatten_incomplete_items,
 )
 from app.services.date_infer import infer_due_iso_from_russian
+from app.services.intent_rules import quick_classify_intent
 from app.services.trello_board_filters import drop_cards_in_archived_lists
 
 
@@ -804,6 +805,16 @@ class TaskOrchestrator:
         return any(m in s for m in markers)
 
     @staticmethod
+    def _is_explicit_new_command(text: str, *, expected_intents: set[str]) -> bool:
+        """True если ответ явно выглядит как новая команда, а не продолжение уточнения."""
+        if TaskOrchestrator._looks_like_new_command(text):
+            return True
+        ruled = quick_classify_intent(text)
+        if ruled is None:
+            return False
+        return ruled not in expected_intents
+
+    @staticmethod
     def _parse_yes_no(reply: str) -> bool | None:
         """Парсим да/нет в свободной форме."""
         raw = (reply or "").strip()
@@ -866,6 +877,15 @@ class TaskOrchestrator:
             after = meta.get("after_clarification")
 
             if after == "create_checklist_item":
+                if self._is_explicit_new_command(text, expected_intents={"add_checklist_items"}):
+                    logger.info(
+                        "create_checklist_item pending dropped, routing as fresh input. text=%r",
+                        text,
+                    )
+                    result = await self.agent_service.infer_action(
+                        text=text, persona=profile.persona.value,
+                    )
+                    return await self._finish_turn(profile, text, result)
                 resume = self._checklist_resume_prompt(meta, text)
                 result = await self.agent_service.infer_action(
                     text=resume,
@@ -897,6 +917,15 @@ class TaskOrchestrator:
                 return await self._finish_turn(profile, text, result)
 
             if after == "create_card":
+                if self._is_explicit_new_command(text, expected_intents={"create_card"}):
+                    logger.info(
+                        "create_card pending dropped, routing as fresh input. text=%r",
+                        text,
+                    )
+                    result = await self.agent_service.infer_action(
+                        text=text, persona=profile.persona.value,
+                    )
+                    return await self._finish_turn(profile, text, result)
                 resume = self._create_card_resume_prompt(meta, text)
                 result = await self.agent_service.infer_action(
                     text=resume,
