@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 import tempfile
 from collections import OrderedDict
 from pathlib import Path
@@ -20,18 +22,28 @@ from app.core.errors import (
     TrelloAPIError,
 )
 from app.db.models import Persona
-from app.db.repositories import ClarificationRepository, UserProfileRepository
+from app.db.repositories import (
+    ClarificationRepository,
+    IntentHistoryRepository,
+    UserProfileRepository,
+)
 from app.integrations.telegram import TelegramClient
 from app.integrations.trello import TrelloClient
 from app.services.active_cards import (
+    build_cards_overview_messages,
+    build_cards_by_days_window_messages,
     build_active_cards_messages,
+    parse_cards_nl_query,
     parse_cards_command_arguments,
 )
 from app.services.agent import AgentService
 from app.services.asr import build_transcription_service
 from app.services.onboarding import OnboardingService
 from app.services.orchestrator import TaskOrchestrator
+from app.services.intent_rules import quick_classify_intent
 from app.services.trello_board_filters import drop_cards_in_archived_lists
+
+logger = logging.getLogger(__name__)
 
 # Защита от повторной обработки одного update_id (несколько воркеров / повтор Telegram).
 _MAX_SEEN_UPDATES = 4000
@@ -82,6 +94,7 @@ async def process_telegram_update(
     tg_client = TelegramClient(settings.telegram_bot_token)
     profile_repo = UserProfileRepository(db)
     clarification_repo = ClarificationRepository(db)
+    intent_history_repo = IntentHistoryRepository(db)
     profile = await profile_repo.get_or_create(user_id)
     trello_client = TrelloClient(settings.trello_api_key, profile.trello_token or settings.trello_api_token)
     orchestrator = TaskOrchestrator(
@@ -142,34 +155,7 @@ async def process_telegram_update(
         await tg_client.send_message(chat_id, f"Доски:\n{preview}\n\nПривязка: /link <board_id>")
         return
 
-    if text and text.strip().startswith("/cards"):
-        cards_filter = parse_cards_command_arguments(text.strip())
-        if cards_filter is None:
-            await tg_client.send_message(
-                chat_id,
-                "Формат:\n"
-                "/cards — все активные (не в «Завершённые», не архив)\n"
-                "/cards 7 — срок в ближайшие 7 календарных дней\n"
-                "/cards сегодня | завтра | неделя\n"
-                "/cards просрочка — дедлайн раньше сегодня\n\n"
-                "Даты «сегодня» считаются в часовом поясе Europe/Moscow.",
-            )
-            return
-        if not profile.trello_board_id:
-            await tg_client.send_message(chat_id, BoardNotLinkedError().user_message)
-            return
-        try:
-            lists_raw = await trello_client.list_lists(profile.trello_board_id)
-            cards_raw = await trello_client.list_board_cards_summary(profile.trello_board_id)
-            cards_raw = drop_cards_in_archived_lists(cards_raw, lists_raw)
-            id_to_name = {str(x["id"]): str(x.get("name") or "") for x in lists_raw}
-            messages = build_active_cards_messages(profile, cards_raw, id_to_name, cards_filter)
-            for chunk in messages:
-                await tg_client.send_message(chat_id, chunk)
-        except TrelloAPIError as exc:
-            await tg_client.send_message(chat_id, exc.user_message)
-        await profile_repo.save(profile)
-        return
+    pending = await clarification_repo.get(profile.telegram_user_id)
 
     if message.get("voice"):
         # Как в build_transcription_service: OpenRouter для Whisper или ключ OpenAI.
@@ -223,7 +209,68 @@ async def process_telegram_update(
             await tg_client.send_message(chat_id, exc.user_message)
             return
 
-    pending = await clarification_repo.get(profile.telegram_user_id)
+    # Слэш-команда /cards и NL-фильтр «какие задачи на сегодня?» проверяем ПОСЛЕ ASR,
+    # чтобы голосовые сообщения тоже маршрутизировались в показ карточек, а не в LLM.
+    if text and text.strip().startswith("/cards"):
+        cards_filter = parse_cards_command_arguments(text.strip())
+        if cards_filter is None:
+            await tg_client.send_message(
+                chat_id,
+                "Формат:\n"
+                "/cards — все активные (не в «Завершённые», не архив)\n"
+                "/cards 7 — срок в ближайшие 7 календарных дней\n"
+                "/cards сегодня | завтра | неделя\n"
+                "/cards просрочка — дедлайн раньше сегодня\n\n"
+                "Даты «сегодня» считаются в часовом поясе Europe/Moscow.",
+            )
+            return
+        if not profile.trello_board_id:
+            await tg_client.send_message(chat_id, BoardNotLinkedError().user_message)
+            return
+        try:
+            lists_raw = await trello_client.list_lists(profile.trello_board_id)
+            cards_raw = await trello_client.list_board_cards_summary(profile.trello_board_id)
+            cards_raw = drop_cards_in_archived_lists(cards_raw, lists_raw)
+            id_to_name = {str(x["id"]): str(x.get("name") or "") for x in lists_raw}
+            messages = build_active_cards_messages(profile, cards_raw, id_to_name, cards_filter)
+            for chunk in messages:
+                await tg_client.send_message(chat_id, chunk)
+        except TrelloAPIError as exc:
+            await tg_client.send_message(chat_id, exc.user_message)
+        await profile_repo.save(profile)
+        return
+
+    if text:
+        nl_filter = parse_cards_nl_query(text.strip())
+        if nl_filter is not None:
+            if pending:
+                await clarification_repo.clear(profile.telegram_user_id)
+            if not profile.trello_board_id:
+                await tg_client.send_message(chat_id, BoardNotLinkedError().user_message)
+                return
+            try:
+                lists_raw = await trello_client.list_lists(profile.trello_board_id)
+                cards_raw = await trello_client.list_board_cards_summary(profile.trello_board_id)
+                cards_raw = drop_cards_in_archived_lists(cards_raw, lists_raw)
+                id_to_name = {str(x["id"]): str(x.get("name") or "") for x in lists_raw}
+                if nl_filter.kind == "today":
+                    messages = build_active_cards_messages(profile, cards_raw, id_to_name, nl_filter)
+                elif nl_filter.kind == "due_within" and (nl_filter.days or 0) <= 7:
+                    messages = build_cards_by_days_window_messages(
+                        profile,
+                        cards_raw,
+                        id_to_name,
+                        nl_filter.days or 1,
+                    )
+                else:
+                    messages = build_active_cards_messages(profile, cards_raw, id_to_name, nl_filter)
+                for chunk in messages:
+                    await tg_client.send_message(chat_id, chunk)
+            except TrelloAPIError as exc:
+                await tg_client.send_message(chat_id, exc.user_message)
+            await profile_repo.save(profile)
+            return
+
     if (
         not pending
         and text
@@ -235,9 +282,22 @@ async def process_telegram_update(
         return
 
     try:
-        result = await orchestrator.process_text(profile, text)
+        intent_context = await intent_history_repo.recent_context(profile.telegram_user_id, limit=8)
+        result = await orchestrator.process_text(profile, text, intent_context=intent_context)
         await profile_repo.save(profile)
         await tg_client.send_message(chat_id, result.text)
+        try:
+            action_type = result.action_type or quick_classify_intent(text) or "unknown"
+            action_payload_json = json.dumps(result.action_payload, ensure_ascii=False) if result.action_payload else None
+            await intent_history_repo.append(
+                telegram_user_id=profile.telegram_user_id,
+                user_text=text,
+                action_type=action_type,
+                response_text=result.text,
+                action_payload_json=action_payload_json,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("intent history append failed for user_id=%s", profile.telegram_user_id)
     except BoardNotLinkedError as exc:
         await tg_client.send_message(chat_id, exc.user_message)
     except OrchestratorValidationError as exc:

@@ -277,6 +277,22 @@ def _normalize_router_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _render_intent_context_block(intent_context: str | None) -> str:
+    if not intent_context:
+        return ""
+    trimmed = intent_context.strip()
+    if not trimmed:
+        return ""
+    if len(trimmed) > 1800:
+        trimmed = trimmed[-1800:]
+    return (
+        "\n\n[Intent History Context]\n"
+        f"{trimmed}\n"
+        "Use this context as a hint for disambiguation (create/update/complete). "
+        "Never invent card ids and never execute older commands automatically."
+    )
+
+
 # ============================================================================
 # Service
 # ============================================================================
@@ -295,6 +311,7 @@ class AgentService:
         persona: str = "mom",
         *,
         forced_intent: str | None = None,
+        intent_context: str | None = None,
     ) -> AgentResult:
         if forced_intent and forced_intent in VALID_INTENTS:
             decision = IntentDecision(
@@ -320,7 +337,7 @@ class AgentService:
                 )
             else:
                 # Шаг 1: LLM-роутер для всех неоднозначных случаев.
-                decision = await self._classify_intent(text, persona)
+                decision = await self._classify_intent(text, persona, intent_context=intent_context)
                 logger.info(
                     "intent_router: LLM intent=%s reasoning=%r text=%r",
                     decision.intent,
@@ -334,7 +351,7 @@ class AgentService:
                 response_text=decision.response_text,
             )
 
-        action = await self._extract_fields(text, persona, decision)
+        action = await self._extract_fields(text, persona, decision, intent_context=intent_context)
         logger.info(
             "intent_extractor: action_type=%s card_name=%r match_text=%r due=%r",
             action.action_type,
@@ -414,11 +431,18 @@ class AgentService:
         return out
 
     # ------------------------------------------------------------------ step 1
-    async def _classify_intent(self, text: str, persona: str) -> IntentDecision:
+    async def _classify_intent(
+        self,
+        text: str,
+        persona: str,
+        *,
+        intent_context: str | None = None,
+    ) -> IntentDecision:
         system = (
             f"{PERSONA_PROMPTS.get(persona, PERSONA_PROMPTS['mom'])}\n"
             f"{calendar_context_for_prompt()}\n\n"
             f"{ROUTER_PROMPT}"
+            f"{_render_intent_context_block(intent_context)}"
         )
         raw_payload = await self._call_llm_json(system, text, step="router")
         raw_payload = _normalize_router_payload(raw_payload)
@@ -434,6 +458,8 @@ class AgentService:
         text: str,
         persona: str,
         decision: IntentDecision,
+        *,
+        intent_context: str | None = None,
     ) -> AgentAction:
         intent = decision.intent
         extractor_prompt = EXTRACTOR_PROMPTS.get(intent)
@@ -447,6 +473,7 @@ class AgentService:
             f"Уже определено намерение: {intent}.\n"
             f"Логика роутера: {decision.reasoning}\n\n"
             f"{extractor_prompt}"
+            f"{_render_intent_context_block(intent_context)}"
         )
         raw_payload = await self._call_llm_json(system, text, step=f"extractor:{intent}")
         raw_payload = _normalize_action_payload(raw_payload)

@@ -40,6 +40,8 @@ from app.services.trello_board_filters import drop_cards_in_archived_lists
 @dataclass
 class OrchestratorResult:
     text: str
+    action_type: str | None = None
+    action_payload: dict[str, object] | None = None
 
 
 def _split_checklist_items(raw: str | None) -> list[str]:
@@ -718,19 +720,35 @@ class TaskOrchestrator:
                 action.question,
                 action.model_dump_json(),
             )
-            return OrchestratorResult(action.question)
+            return OrchestratorResult(
+                action.question,
+                action_type=action.action_type,
+                action_payload=action.model_dump(mode="json"),
+            )
 
         if action.action_type == "set_persona":
             persona = action.metadata.get("persona")
             if persona in {"elon", "zen", "mom"}:
                 profile.persona = Persona(persona)
-                return OrchestratorResult(f"Режим ассистента переключен на: {persona}.")
+                return OrchestratorResult(
+                    f"Режим ассистента переключен на: {persona}.",
+                    action_type=action.action_type,
+                    action_payload=action.model_dump(mode="json"),
+                )
 
         if action.action_type == "none":
-            return OrchestratorResult(result.response_text)
+            return OrchestratorResult(
+                result.response_text,
+                action_type=action.action_type,
+                action_payload=action.model_dump(mode="json"),
+            )
 
         await self._execute_action(profile, action)
-        return OrchestratorResult(success_text or result.response_text)
+        return OrchestratorResult(
+            success_text or result.response_text,
+            action_type=action.action_type,
+            action_payload=action.model_dump(mode="json"),
+        )
 
     @staticmethod
     def _pick_complete_task_candidate(
@@ -865,7 +883,27 @@ class TaskOrchestrator:
             return True
         return False
 
-    async def process_text(self, profile: UserProfile, text: str) -> OrchestratorResult:
+    async def process_text(
+        self,
+        profile: UserProfile,
+        text: str,
+        *,
+        intent_context: str | None = None,
+    ) -> OrchestratorResult:
+        async def infer(user_text: str, forced_intent: str | None = None) -> AgentResult:
+            if intent_context is None:
+                return await self.agent_service.infer_action(
+                    text=user_text,
+                    persona=profile.persona.value,
+                    forced_intent=forced_intent,
+                )
+            return await self.agent_service.infer_action(
+                text=user_text,
+                persona=profile.persona.value,
+                forced_intent=forced_intent,
+                intent_context=intent_context,
+            )
+
         pending = await self.clarification_repo.get(profile.telegram_user_id)
         if pending:
             await self.clarification_repo.clear(profile.telegram_user_id)
@@ -882,16 +920,10 @@ class TaskOrchestrator:
                         "create_checklist_item pending dropped, routing as fresh input. text=%r",
                         text,
                     )
-                    result = await self.agent_service.infer_action(
-                        text=text, persona=profile.persona.value,
-                    )
+                    result = await infer(text)
                     return await self._finish_turn(profile, text, result)
                 resume = self._checklist_resume_prompt(meta, text)
-                result = await self.agent_service.infer_action(
-                    text=resume,
-                    persona=profile.persona.value,
-                    forced_intent="add_checklist_items",
-                )
+                result = await infer(resume, forced_intent="add_checklist_items")
                 return await self._finish_turn(profile, resume, result)
 
             if after == "add_checklist_pick_card":
@@ -913,7 +945,7 @@ class TaskOrchestrator:
                     "add_checklist_pick_card pending dropped, routing as fresh input. text=%r",
                     text,
                 )
-                result = await self.agent_service.infer_action(text=text, persona=profile.persona.value)
+                result = await infer(text)
                 return await self._finish_turn(profile, text, result)
 
             if after == "create_card":
@@ -922,16 +954,10 @@ class TaskOrchestrator:
                         "create_card pending dropped, routing as fresh input. text=%r",
                         text,
                     )
-                    result = await self.agent_service.infer_action(
-                        text=text, persona=profile.persona.value,
-                    )
+                    result = await infer(text)
                     return await self._finish_turn(profile, text, result)
                 resume = self._create_card_resume_prompt(meta, text)
-                result = await self.agent_service.infer_action(
-                    text=resume,
-                    persona=profile.persona.value,
-                    forced_intent="create_card",
-                )
+                result = await infer(resume, forced_intent="create_card")
                 return await self._finish_turn(profile, resume, result)
 
             if after == "complete_task":
@@ -959,7 +985,7 @@ class TaskOrchestrator:
                     text,
                     len(candidates),
                 )
-                result = await self.agent_service.infer_action(text=text, persona=profile.persona.value)
+                result = await infer(text)
                 return await self._finish_turn(profile, text, result)
 
             if after == "complete_card":
@@ -993,7 +1019,7 @@ class TaskOrchestrator:
                     text,
                     len(candidates),
                 )
-                result = await self.agent_service.infer_action(text=text, persona=profile.persona.value)
+                result = await infer(text)
                 return await self._finish_turn(profile, text, result)
 
             if after == "complete_card_force":
@@ -1023,9 +1049,7 @@ class TaskOrchestrator:
                         "complete_card_force pending dropped, routing as fresh input. text=%r",
                         text,
                     )
-                    result = await self.agent_service.infer_action(
-                        text=text, persona=profile.persona.value,
-                    )
+                    result = await infer(text)
                     return await self._finish_turn(profile, text, result)
                 # Иначе — переспрашиваем и сохраняем контекст.
                 question = (
@@ -1052,7 +1076,7 @@ class TaskOrchestrator:
             # Совместимость: старый путь без after_clarification — пробуем выполнить как есть,
             # но защищаемся от silent failure для самого ask_for_clarification.
             if draft.get("action_type") in (None, "ask_for_clarification"):
-                result = await self.agent_service.infer_action(text=text, persona=profile.persona.value)
+                result = await infer(text)
                 return await self._finish_turn(profile, text, result)
 
             draft["metadata"] = {**meta, "clarification_answer": text}
@@ -1060,7 +1084,7 @@ class TaskOrchestrator:
             await self._execute_action(profile, action)
             return OrchestratorResult("Спасибо за уточнение. Готово.")
 
-        result = await self.agent_service.infer_action(text=text, persona=profile.persona.value)
+        result = await infer(text)
         return await self._finish_turn(profile, text, result)
 
     async def _execute_action(self, profile: UserProfile, action: AgentAction) -> None:

@@ -39,3 +39,15 @@ class PendingClarification(Base):
     draft_action_json: Mapped[str] = mapped_column(Text)
     question: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class IntentHistory(Base):
+    __tablename__ = "intent_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id: Mapped[int] = mapped_column(Integer, index=True)
+    user_text: Mapped[str] = mapped_column(Text)
+    action_type: Mapped[str] = mapped_column(String(64))
+    action_payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    response_text: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
