@@ -131,6 +131,24 @@ def _extract_index_from_reply(reply: str, max_idx: int) -> int | None:
     return None
 
 
+def _extract_indices_from_reply(reply: str, max_idx: int) -> list[int]:
+    if max_idx <= 0:
+        return []
+    s = (reply or "").strip().lower().replace("ё", "е")
+    if not s:
+        return []
+    found: set[int] = set()
+    for m in re.finditer(r"\b(\d{1,2})\b", s):
+        idx = int(m.group(1))
+        if 1 <= idx <= max_idx:
+            found.add(idx)
+    for token in re.findall(r"[а-яa-z]+", s):
+        idx = _RU_INDEX_WORDS.get(token.replace("ё", "е"))
+        if idx is not None and 1 <= idx <= max_idx:
+            found.add(idx)
+    return sorted(found)
+
+
 def _checklist_add_card_search_queries(user_text: str, action: AgentAction) -> list[str]:
     """Запросы для поиска карточки при добавлении в чеклист.
 
@@ -883,6 +901,192 @@ class TaskOrchestrator:
             return True
         return False
 
+    @staticmethod
+    def _parse_checklist_clarification_reply(reply: str) -> tuple[str | None, list[int], list[str]]:
+        raw = (reply or "").strip()
+        s = unicodedata.normalize("NFC", raw).lower().replace("ё", "е")
+        if not s:
+            return None, [], []
+
+        idxs = _extract_indices_from_reply(s, 99)
+        quoted = [q.strip() for q in re.findall(r"[«\"]([^»\"]{1,120})[»\"]", raw) if q.strip()]
+        terms = list(quoted)
+
+        if not terms:
+            m = re.search(r"кроме\s+(.+)$", raw, flags=re.IGNORECASE)
+            fragment = m.group(1) if m else ""
+            if fragment:
+                parts = re.split(r"[,;]|(?:\s+и\s+)|(?:\s+или\s+)", fragment, flags=re.IGNORECASE)
+                stop = {
+                    "пункт", "пункта", "пункты", "пунктах",
+                    "одного", "первого", "второго", "третьего",
+                    "сделано", "сделал", "сделала", "ничего",
+                }
+                for p in parts:
+                    t = re.sub(r"[^\wа-яА-ЯёЁ\- ]+", "", p).strip()
+                    if not t:
+                        continue
+                    low = t.lower().replace("ё", "е")
+                    if low in stop:
+                        continue
+                    if len(t) >= 2:
+                        terms.append(t)
+
+        has_except = "кроме" in s
+        only_words = any(t in s for t in ("только", "лишь"))
+        nothing_done_except = "ничего не сдел" in s and has_except
+
+        if nothing_done_except or only_words:
+            return "only", idxs, terms
+        if has_except:
+            return "all_except", idxs, terms
+        if idxs or terms:
+            return "only", idxs, terms
+        return None, [], []
+
+    @staticmethod
+    def _norm_match_text(v: str) -> str:
+        s = unicodedata.normalize("NFC", (v or "").lower()).replace("ё", "е")
+        s = re.sub(r"\s+", " ", s)
+        return s.strip()
+
+    @staticmethod
+    def _match_check_items_by_terms(
+        items: list[dict[str, str]],
+        terms: list[str],
+    ) -> tuple[set[str], list[str]]:
+        matched: set[str] = set()
+        unresolved: list[str] = []
+        if not terms:
+            return matched, unresolved
+        for term in terms:
+            nterm = TaskOrchestrator._norm_match_text(term)
+            if not nterm:
+                continue
+            direct = [it for it in items if nterm in TaskOrchestrator._norm_match_text(it["item_name"])]
+            if direct:
+                matched.update(it["check_item_id"] for it in direct)
+                continue
+            best_item: dict[str, str] | None = None
+            best_score = 0.0
+            for it in items:
+                score = SequenceMatcher(
+                    None,
+                    nterm,
+                    TaskOrchestrator._norm_match_text(it["item_name"]),
+                ).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_item = it
+            if best_item is not None and best_score >= 0.62:
+                matched.add(best_item["check_item_id"])
+            else:
+                unresolved.append(term)
+        return matched, unresolved
+
+    async def _try_handle_human_checklist_clarification(
+        self,
+        profile: UserProfile,
+        *,
+        draft: dict[str, object],
+        question: str,
+        reply: str,
+    ) -> OrchestratorResult | None:
+        mode, idxs, terms = self._parse_checklist_clarification_reply(reply)
+        if mode is None:
+            return None
+        if not profile.trello_board_id:
+            return None
+
+        card_id_hint = str(draft.get("card_id") or "")
+        card_name_hint = str(draft.get("card_name") or "")
+        if not card_name_hint:
+            card_name_hint = str(draft.get("match_text") or "")
+        if not card_name_hint:
+            card_name_hint = _infer_card_title_from_user_text(question) or ""
+
+        lists_raw = await self.trello_client.list_lists(profile.trello_board_id)
+        payload = await self.trello_client.list_board_cards_with_checklists(profile.trello_board_id)
+        payload = drop_cards_in_archived_lists(payload, lists_raw)
+        cards = cards_from_payload(payload)
+        done_id = profile.trello_done_list_id
+        if done_id:
+            cards = [c for c in cards if c.list_id != done_id]
+
+        target_card: CardRef | None = None
+        if card_id_hint:
+            target_card = next((c for c in cards if c.card_id == card_id_hint), None)
+        if target_card is None and card_name_hint:
+            hits = await self._search_cards_hybrid(profile, card_name_hint, cards)
+            winner = confident_unique_hit(hits)
+            if winner is not None:
+                target_card = next((c for c in cards if c.card_id == winner.card_id), None)
+
+        if target_card is None:
+            return None
+
+        checklists = await self.trello_client.list_card_checklists(target_card.card_id)
+        open_items: list[dict[str, str]] = []
+        for cl in checklists:
+            checklist_id = str(cl.get("id") or "")
+            if not checklist_id:
+                continue
+            for ci in cl.get("checkItems") or []:
+                if (ci.get("state") or "incomplete") == "complete":
+                    continue
+                item_id = str(ci.get("id") or "")
+                item_name = str(ci.get("name") or "").strip()
+                if not item_id or not item_name:
+                    continue
+                open_items.append(
+                    {
+                        "checklist_id": checklist_id,
+                        "check_item_id": item_id,
+                        "item_name": item_name,
+                    },
+                )
+        if not open_items:
+            return OrchestratorResult(
+                f"В карточке «{target_card.card_name}» уже нет невыполненных пунктов.",
+            )
+
+        selected_ids: set[str] = set()
+        if idxs:
+            for idx in idxs:
+                if 1 <= idx <= len(open_items):
+                    selected_ids.add(open_items[idx - 1]["check_item_id"])
+        term_ids, unresolved = self._match_check_items_by_terms(open_items, terms)
+        selected_ids.update(term_ids)
+
+        if mode == "all_except":
+            excluded_ids = set(selected_ids)
+            to_complete = [it for it in open_items if it["check_item_id"] not in excluded_ids]
+        else:
+            to_complete = [it for it in open_items if it["check_item_id"] in selected_ids]
+
+        if unresolved and not to_complete:
+            return OrchestratorResult(
+                "Не понял, какие именно пункты отметить. Назовите номер пункта или точное название.",
+            )
+        if not to_complete:
+            return OrchestratorResult(
+                "Не нашёл подходящих пунктов для отметки. Уточните номер или формулировку пункта.",
+            )
+
+        for it in to_complete:
+            await self.trello_client.update_check_item_on_card(
+                target_card.card_id,
+                it["checklist_id"],
+                it["check_item_id"],
+                complete=True,
+            )
+        names = [it["item_name"] for it in to_complete[:3]]
+        preview = "; ".join(names)
+        extra = "" if len(to_complete) <= 3 else f" и ещё {len(to_complete) - 3}"
+        return OrchestratorResult(
+            f"Отметил выполненными пунктов: {len(to_complete)} в карточке «{target_card.card_name}» ({preview}{extra}).",
+        )
+
     async def process_text(
         self,
         profile: UserProfile,
@@ -1076,6 +1280,14 @@ class TaskOrchestrator:
             # Совместимость: старый путь без after_clarification — пробуем выполнить как есть,
             # но защищаемся от silent failure для самого ask_for_clarification.
             if draft.get("action_type") in (None, "ask_for_clarification"):
+                human_checklist = await self._try_handle_human_checklist_clarification(
+                    profile,
+                    draft=draft,
+                    question=str(pending.question or ""),
+                    reply=text,
+                )
+                if human_checklist is not None:
+                    return human_checklist
                 result = await infer(text)
                 return await self._finish_turn(profile, text, result)
 
