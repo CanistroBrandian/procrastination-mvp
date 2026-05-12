@@ -520,6 +520,59 @@ class TaskOrchestrator:
                 n += 1
         return n
 
+    async def _list_incomplete_checklist_item_names(self, card_id: str) -> list[str]:
+        checklists = await self.trello_client.list_card_checklists(card_id)
+        items: list[str] = []
+        for cl in checklists:
+            for ci in cl.get("checkItems") or []:
+                if (ci.get("state") or "incomplete") == "complete":
+                    continue
+                name = str(ci.get("name") or "").strip()
+                if name:
+                    items.append(name)
+        return items
+
+    @staticmethod
+    def _build_complete_card_force_question(card_name: str, remaining_items: list[str]) -> str:
+        if remaining_items:
+            preview = "; ".join(remaining_items[:5])
+            extra = "" if len(remaining_items) <= 5 else f" и ещё {len(remaining_items) - 5}"
+            return (
+                f"В карточке «{card_name}» есть невыполненные пункты: {preview}{extra}. "
+                "Всё равно перевести в «Завершённые»? Ответьте «да» или «нет»."
+            )
+        return (
+            f"В карточке «{card_name}» больше нет невыполненных пунктов. "
+            "Перевести её в «Завершённые»? Ответьте «да» или «нет»."
+        )
+
+    async def _upsert_complete_card_force_pending(
+        self,
+        profile: UserProfile,
+        *,
+        card_id: str,
+        card_name: str,
+        remaining_items: list[str],
+        question_override: str | None = None,
+    ) -> str:
+        question = question_override or self._build_complete_card_force_question(card_name, remaining_items)
+        pending_action = AgentAction(
+            action_type="ask_for_clarification",
+            question=question,
+            metadata={
+                "after_clarification": "complete_card_force",
+                "card_id": card_id,
+                "card_name": card_name,
+                "remaining_items": list(remaining_items),
+            },
+        )
+        await self.clarification_repo.upsert(
+            telegram_user_id=profile.telegram_user_id,
+            question=question,
+            draft_action_json=pending_action.model_dump_json(),
+        )
+        return question
+
     async def _resolve_complete_card(
         self,
         profile: UserProfile,
@@ -1232,6 +1285,33 @@ class TaskOrchestrator:
                     ans = True if self._implies_complete_card_force_yes(text) else None
                 card_id = str(meta.get("card_id") or "")
                 card_name = str(meta.get("card_name") or "")
+                human_checklist = await self._try_handle_human_checklist_clarification(
+                    profile,
+                    draft={"card_id": card_id, "card_name": card_name, "metadata": meta},
+                    question=str(pending.question or ""),
+                    reply=text,
+                )
+                if human_checklist is not None and card_id:
+                    remaining = await self._list_incomplete_checklist_item_names(card_id)
+                    if not remaining:
+                        action = AgentAction(action_type="move_card", card_id=card_id, list_name="done")
+                        await self._execute_action(profile, action)
+                        return OrchestratorResult(
+                            f"{human_checklist.text} Перевёл карточку «{card_name}» в «Завершённые».",
+                        )
+                    question = await self._upsert_complete_card_force_pending(
+                        profile,
+                        card_id=card_id,
+                        card_name=card_name,
+                        remaining_items=remaining,
+                        question_override=(
+                            f"{human_checklist.text} "
+                            f"Карточку «{card_name}» пока не перевожу: остались незавершённые пункты. "
+                            "Когда будете готовы закрыть карточку целиком, ответьте «да». "
+                            "Можно продолжить отмечать пункты этой же карточки."
+                        ),
+                    )
+                    return OrchestratorResult(question)
                 if ans is True and card_id:
                     n_done = await self._complete_all_incomplete_checklist_items(card_id)
                     action = AgentAction(action_type="move_card", card_id=card_id, list_name="done")
@@ -1243,37 +1323,75 @@ class TaskOrchestrator:
                         )
                     return OrchestratorResult(f"Перевёл карточку «{card_name}» в «Завершённые».")
                 if ans is False:
-                    return OrchestratorResult(
-                        "Хорошо, не переводил. Сначала отметьте оставшиеся пункты выполненными "
-                        "(скажите, что именно сделали), и тогда я закрою карточку.",
+                    question = await self._upsert_complete_card_force_pending(
+                        profile,
+                        card_id=card_id,
+                        card_name=card_name,
+                        remaining_items=[str(x) for x in list(meta.get("remaining_items") or [])],
+                        question_override=(
+                            f"Ок, карточку «{card_name}» не перевожу. "
+                            "Скажите, какие пункты отметить выполненными в этой же карточке "
+                            "(например: «закрыть 1 и 2» или «все, кроме …»)."
+                        ),
                     )
+                    return OrchestratorResult(question)
                 # Если новый ввод похож на полноценную команду — выходим из force-режима.
                 if self._looks_like_new_command(text):
-                    logger.info(
-                        "complete_card_force pending dropped, routing as fresh input. text=%r",
-                        text,
+                    question = (
+                        f"Сейчас мы завершаем карточку «{card_name}». "
+                        "Переключиться на новую команду или продолжить текущую карточку? "
+                        "Ответьте: «переключиться» или «продолжить»."
                     )
-                    result = await infer(text)
-                    return await self._finish_turn(profile, text, result)
+                    pending_action = AgentAction(
+                        action_type="ask_for_clarification",
+                        question=question,
+                        metadata={
+                            "after_clarification": "confirm_flow_switch",
+                            "candidate_new_text": text,
+                            "resume_action": draft,
+                        },
+                    )
+                    await self.clarification_repo.upsert(
+                        telegram_user_id=profile.telegram_user_id,
+                        question=question,
+                        draft_action_json=pending_action.model_dump_json(),
+                    )
+                    return OrchestratorResult(question)
                 # Иначе — переспрашиваем и сохраняем контекст.
-                question = (
-                    f"Не понял ответ. Перевести карточку «{card_name}» в «Завершённые», "
-                    "несмотря на невыполненные пункты? Ответьте «да» или «нет»."
+                question = await self._upsert_complete_card_force_pending(
+                    profile,
+                    card_id=card_id,
+                    card_name=card_name,
+                    remaining_items=[str(x) for x in list(meta.get("remaining_items") or [])],
+                    question_override=(
+                        f"Не понял ответ. Перевести карточку «{card_name}» в «Завершённые», "
+                        "несмотря на невыполненные пункты? Ответьте «да» или «нет»."
+                    ),
                 )
-                pending_action = AgentAction(
-                    action_type="ask_for_clarification",
-                    question=question,
-                    metadata={
-                        "after_clarification": "complete_card_force",
-                        "card_id": card_id,
-                        "card_name": card_name,
-                        "remaining_items": list(meta.get("remaining_items") or []),
-                    },
-                )
+                return OrchestratorResult(question)
+
+            if after == "confirm_flow_switch":
+                s = unicodedata.normalize("NFC", (text or "").strip().lower()).replace("ё", "е")
+                is_switch = any(t in s for t in ("переключ", "новую команд", "новое"))
+                is_continue = any(t in s for t in ("продолж", "текущ", "остаемся", "остаёмся"))
+                if is_switch:
+                    fresh_text = str(meta.get("candidate_new_text") or text)
+                    result = await infer(fresh_text)
+                    return await self._finish_turn(profile, fresh_text, result)
+                if is_continue:
+                    resume = meta.get("resume_action") or {}
+                    question = str((resume.get("question") if isinstance(resume, dict) else "") or "Продолжаем текущий шаг.")
+                    await self.clarification_repo.upsert(
+                        telegram_user_id=profile.telegram_user_id,
+                        question=question,
+                        draft_action_json=json.dumps(resume, ensure_ascii=False),
+                    )
+                    return OrchestratorResult(question)
+                question = str(pending.question or "")
                 await self.clarification_repo.upsert(
                     telegram_user_id=profile.telegram_user_id,
                     question=question,
-                    draft_action_json=pending_action.model_dump_json(),
+                    draft_action_json=json.dumps(draft, ensure_ascii=False),
                 )
                 return OrchestratorResult(question)
 
