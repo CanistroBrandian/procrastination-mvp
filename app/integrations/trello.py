@@ -138,6 +138,13 @@ class TrelloClient:
             },
         )
 
+    async def get_card(self, card_id: str) -> dict[str, Any]:
+        return await self._request(
+            "GET",
+            f"/cards/{card_id}",
+            {"fields": "name,desc,idList,closed,shortUrl"},
+        )
+
     async def list_card_checklists(self, card_id: str) -> list[dict[str, Any]]:
         """Чеклисты карточки с пунктами — надёжнее, чем вложение в GET /cards/{id} (Trello не всегда отдаёт checkItems)."""
         return await self._request(

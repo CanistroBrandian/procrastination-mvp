@@ -1096,6 +1096,50 @@ class TaskOrchestrator:
         return None
 
     @staticmethod
+    def _parse_link_attach_mode(reply: str) -> str | None:
+        s = unicodedata.normalize("NFC", (reply or "").strip().lower()).replace("ё", "е")
+        if not s:
+            return None
+        idx = _extract_index_from_reply(s, 2)
+        if idx == 1:
+            return "checklist"
+        if idx == 2:
+            return "description"
+        if any(token in s for token in ("чеклист", "чек лист", "checkbox", "чекбокс", "пункт", "галоч")):
+            return "checklist"
+        if any(token in s for token in ("описан", "description", "desc", "в описание", "в описании", "текст")):
+            return "description"
+        return None
+
+    async def _append_lines_to_card_description(self, card_id: str, lines: list[str]) -> None:
+        prepared = [line.strip() for line in lines if (line or "").strip()]
+        if not prepared:
+            return
+        card = await self.trello_client.get_card(card_id)
+        current = str(card.get("desc") or "").strip()
+        addition = "\n".join(prepared)
+        new_desc = f"{current}\n\n{addition}" if current else addition
+        await self.trello_client.update_card(card_id, desc=new_desc)
+
+    async def _resolve_card_candidates_for_query(
+        self,
+        profile: UserProfile,
+        query: str,
+    ) -> tuple[str | None, str | None, list[dict[str, str]]]:
+        if not profile.trello_board_id:
+            raise BoardNotLinkedError()
+        lists_raw = await self.trello_client.list_lists(profile.trello_board_id)
+        payload = await self.trello_client.list_board_cards_with_checklists(profile.trello_board_id)
+        payload = drop_cards_in_archived_lists(payload, lists_raw)
+        cards = cards_from_payload(payload)
+        hits = await self._search_cards_hybrid(profile, query, cards)
+        winner = confident_unique_hit(hits)
+        if winner is not None:
+            return winner.card_id, winner.card_name, []
+        candidates = [{"card_id": h.card_id, "card_name": h.card_name} for h in hits[:5]]
+        return None, None, candidates
+
+    @staticmethod
     def _looks_like_new_command(text: str) -> bool:
         """Эвристика: реплика выглядит как НОВАЯ команда, а не ответ на уточнение.
 
@@ -1501,6 +1545,153 @@ class TaskOrchestrator:
                     telegram_user_id=profile.telegram_user_id,
                     question=question,
                     draft_action_json=json.dumps(draft, ensure_ascii=False),
+                )
+                return OrchestratorResult(question)
+
+            if after == "attach_asset_pick_card":
+                asset_kind = str(meta.get("asset_kind") or "link")
+                raw_urls = meta.get("asset_urls")
+                asset_urls: list[str]
+                if isinstance(raw_urls, list):
+                    asset_urls = [str(x).strip() for x in raw_urls if str(x).strip()]
+                else:
+                    single = str(meta.get("asset_url") or "").strip()
+                    asset_urls = [single] if single else []
+                if not asset_urls:
+                    return OrchestratorResult("Не нашел ссылку или файл для прикрепления. Отправьте еще раз.")
+
+                chosen_id: str | None = None
+                chosen_name: str | None = None
+                candidates = list(meta.get("candidates") or [])
+                if candidates and not self._looks_like_new_command(text):
+                    chosen = self._pick_complete_card_candidate(candidates, text)
+                    if chosen is not None:
+                        chosen_id = str(chosen.get("card_id") or "")
+                        chosen_name = str(chosen.get("card_name") or "")
+
+                if not chosen_id:
+                    if self._looks_like_new_command(text):
+                        result = await infer(text)
+                        return await self._finish_turn(profile, text, result)
+                    query = _infer_card_title_from_user_text(text) or text.strip()
+                    if not query:
+                        question = "К какой задаче прикрепить это? Напишите название карточки."
+                        pending_action = AgentAction(
+                            action_type="ask_for_clarification",
+                            question=question,
+                            metadata={**meta, "after_clarification": "attach_asset_pick_card"},
+                        )
+                        await self.clarification_repo.upsert(
+                            telegram_user_id=profile.telegram_user_id,
+                            question=question,
+                            draft_action_json=pending_action.model_dump_json(),
+                        )
+                        return OrchestratorResult(question)
+                    resolved_id, resolved_name, new_candidates = await self._resolve_card_candidates_for_query(profile, query)
+                    if resolved_id and resolved_name:
+                        chosen_id = resolved_id
+                        chosen_name = resolved_name
+                    else:
+                        if new_candidates:
+                            listing = "\n".join(f"{i + 1}) {c['card_name']}" for i, c in enumerate(new_candidates))
+                            question = f"Нашел несколько карточек. Выберите номер:\n{listing}"
+                            pending_action = AgentAction(
+                                action_type="ask_for_clarification",
+                                question=question,
+                                metadata={
+                                    **meta,
+                                    "after_clarification": "attach_asset_pick_card",
+                                    "candidates": new_candidates,
+                                },
+                            )
+                            await self.clarification_repo.upsert(
+                                telegram_user_id=profile.telegram_user_id,
+                                question=question,
+                                draft_action_json=pending_action.model_dump_json(),
+                            )
+                            return OrchestratorResult(question)
+                        question = f"Не нашел карточку по «{query}». Напишите точное название задачи."
+                        pending_action = AgentAction(
+                            action_type="ask_for_clarification",
+                            question=question,
+                            metadata={**meta, "after_clarification": "attach_asset_pick_card"},
+                        )
+                        await self.clarification_repo.upsert(
+                            telegram_user_id=profile.telegram_user_id,
+                            question=question,
+                            draft_action_json=pending_action.model_dump_json(),
+                        )
+                        return OrchestratorResult(question)
+
+                if asset_kind == "file":
+                    await self._append_lines_to_card_description(chosen_id, [f"Файл: {url}" for url in asset_urls])
+                    return OrchestratorResult(f"Добавил файл в описание карточки «{chosen_name or chosen_id}».")
+
+                question = (
+                    "Как прикрепить ссылку?\n"
+                    "1) Добавить как пункт чеклиста\n"
+                    "2) Добавить в описание"
+                )
+                pending_action = AgentAction(
+                    action_type="ask_for_clarification",
+                    question=question,
+                    metadata={
+                        "after_clarification": "attach_link_choose_mode",
+                        "asset_urls": asset_urls,
+                        "card_id": chosen_id,
+                        "card_name": chosen_name,
+                    },
+                )
+                await self.clarification_repo.upsert(
+                    telegram_user_id=profile.telegram_user_id,
+                    question=question,
+                    draft_action_json=pending_action.model_dump_json(),
+                )
+                return OrchestratorResult(question)
+
+            if after == "attach_link_choose_mode":
+                mode = self._parse_link_attach_mode(text)
+                card_id = str(meta.get("card_id") or "")
+                card_name = str(meta.get("card_name") or card_id)
+                raw_urls = meta.get("asset_urls")
+                if isinstance(raw_urls, list):
+                    asset_urls = [str(x).strip() for x in raw_urls if str(x).strip()]
+                else:
+                    single = str(meta.get("asset_url") or "").strip()
+                    asset_urls = [single] if single else []
+                if not card_id or not asset_urls:
+                    return OrchestratorResult("Не хватает данных для прикрепления ссылки. Отправьте ссылку еще раз.")
+                if mode == "checklist":
+                    action = AgentAction(
+                        action_type="create_checklist_item",
+                        card_id=card_id,
+                        checklist_name="Ссылки",
+                        checklist_item="; ".join(asset_urls),
+                    )
+                    await self._execute_action(profile, action)
+                    return OrchestratorResult(f"Добавил ссылку в чеклист карточки «{card_name}».")
+                if mode == "description":
+                    await self._append_lines_to_card_description(card_id, [f"Ссылка: {url}" for url in asset_urls])
+                    return OrchestratorResult(f"Добавил ссылку в описание карточки «{card_name}».")
+                question = (
+                    "Не понял формат. Выберите вариант:\n"
+                    "1) Чеклист\n"
+                    "2) Описание"
+                )
+                pending_action = AgentAction(
+                    action_type="ask_for_clarification",
+                    question=question,
+                    metadata={
+                        "after_clarification": "attach_link_choose_mode",
+                        "asset_urls": asset_urls,
+                        "card_id": card_id,
+                        "card_name": card_name,
+                    },
+                )
+                await self.clarification_repo.upsert(
+                    telegram_user_id=profile.telegram_user_id,
+                    question=question,
+                    draft_action_json=pending_action.model_dump_json(),
                 )
                 return OrchestratorResult(question)
 

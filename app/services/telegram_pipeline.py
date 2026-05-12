@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import tempfile
 from collections import OrderedDict
 from pathlib import Path
@@ -42,6 +43,7 @@ from app.services.asr import build_transcription_service
 from app.services.onboarding import OnboardingService
 from app.services.orchestrator import TaskOrchestrator
 from app.services.intent_rules import quick_classify_intent
+from app.schemas.actions import AgentAction
 from app.services.trello_board_filters import drop_cards_in_archived_lists
 
 logger = logging.getLogger(__name__)
@@ -49,6 +51,7 @@ logger = logging.getLogger(__name__)
 # Защита от повторной обработки одного update_id (несколько воркеров / повтор Telegram).
 _MAX_SEEN_UPDATES = 4000
 _seen_update_ids: OrderedDict[int, None] = OrderedDict()
+_URL_RE = re.compile(r"https?://[^\s<>\"']+")
 
 
 def _already_processed_update(update_id: int) -> bool:
@@ -68,6 +71,17 @@ def _get_text(update: dict) -> str | None:
 def _fallback_message(exc: BaseException) -> str:
     """Если ошибка не классифицирована — краткий текст без огромного traceback."""
     return f"Неожиданная ошибка: {exc!s}"[:500]
+
+
+def _extract_urls(text: str | None) -> list[str]:
+    if not text:
+        return []
+    urls: list[str] = []
+    for raw in _URL_RE.findall(text):
+        cleaned = raw.rstrip(".,;:!?)")
+        if cleaned and cleaned not in urls:
+            urls.append(cleaned)
+    return urls
 
 
 async def process_telegram_update(
@@ -199,21 +213,63 @@ async def process_telegram_update(
             )
             return
 
-    if not text:
+    if not text and not message.get("document"):
         await tg_client.send_message(chat_id, "Не понял сообщение. Отправь текст или голосовое.")
         return
 
+    if not text and message.get("document"):
+        text = "__document__"
+
+    document_url: str | None = None
     if message.get("document"):
         try:
             file_id = message["document"]["file_id"]
             file_path = await tg_client.get_file_path(file_id)
-            text = f"{text}\nfile_url={tg_client.build_file_download_url(file_path)}"
+            document_url = tg_client.build_file_download_url(file_path)
         except TelegramAPIError as exc:
             await tg_client.send_message(chat_id, exc.user_message)
             return
 
     # Слэш-команда /cards и NL-фильтр «какие задачи на сегодня?» проверяем ПОСЛЕ ASR,
     # чтобы голосовые сообщения тоже маршрутизировались в показ карточек, а не в LLM.
+    urls = _extract_urls(text)
+    is_asset_message = bool(document_url or urls)
+    if is_asset_message and not pending and (not text or not text.strip().startswith("/")):
+        if not profile.trello_board_id:
+            await tg_client.send_message(chat_id, BoardNotLinkedError().user_message)
+            return
+        asset_kind = "file" if document_url else "link"
+        asset_urls = [document_url] if document_url else urls
+        question = (
+            "К какой задаче прикрепить файл? Напишите название карточки."
+            if asset_kind == "file"
+            else "К какой задаче прикрепить ссылку? Напишите название карточки."
+        )
+        pending_action = AgentAction(
+            action_type="ask_for_clarification",
+            question=question,
+            metadata={
+                "after_clarification": "attach_asset_pick_card",
+                "asset_kind": asset_kind,
+                "asset_urls": asset_urls,
+            },
+        )
+        await clarification_repo.upsert(
+            telegram_user_id=profile.telegram_user_id,
+            question=question,
+            draft_action_json=pending_action.model_dump_json(),
+        )
+        await conversation_state_repo.upsert(
+            profile.telegram_user_id,
+            active_flow="attach_asset_pick_card",
+            pending_action_json=pending_action.model_dump_json(),
+        )
+        await tg_client.send_message(chat_id, question)
+        return
+
+    if text == "__document__":
+        text = ""
+
     if text and text.strip().startswith("/cards"):
         cards_filter = parse_cards_command_arguments(text.strip())
         if cards_filter is None:
