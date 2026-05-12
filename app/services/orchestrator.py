@@ -12,10 +12,11 @@ from app.core.errors import BoardNotLinkedError, OrchestratorValidationError
 
 logger = logging.getLogger(__name__)
 from app.db.models import Persona, UserProfile
-from app.db.repositories import ClarificationRepository
+from app.db.repositories import ClarificationRepository, ConversationStateRepository
 from app.integrations.trello import TrelloClient
 from app.schemas.actions import AgentAction, AgentResult
 from app.services.agent import AgentService
+from app.services.card_resolver import CardResolver
 from app.services.card_search import (
     CardSearchHit,
     confident_unique_hit,
@@ -42,6 +43,11 @@ class OrchestratorResult:
     text: str
     action_type: str | None = None
     action_payload: dict[str, object] | None = None
+    flow_status: str | None = None
+    resolved_card_id: str | None = None
+    resolved_card_name: str | None = None
+    resolution_confidence: float | None = None
+    flow_id: str | None = None
 
 
 def _split_checklist_items(raw: str | None) -> list[str]:
@@ -204,10 +210,40 @@ class TaskOrchestrator:
         agent_service: AgentService,
         trello_client: TrelloClient,
         clarification_repo: ClarificationRepository,
+        conversation_state_repo: ConversationStateRepository | None = None,
     ):
         self.agent_service = agent_service
         self.trello_client = trello_client
         self.clarification_repo = clarification_repo
+        self.conversation_state_repo = conversation_state_repo
+        self.card_resolver = CardResolver(trello_client=trello_client, agent_service=agent_service)
+
+    async def _state_context(self, profile: UserProfile) -> tuple[str | None, str | None, str | None]:
+        if self.conversation_state_repo is None:
+            return None, None, None
+        state = await self.conversation_state_repo.get(profile.telegram_user_id)
+        if state is None:
+            return None, None, None
+        return state.active_flow, state.active_card_id, state.active_card_name
+
+    async def _persist_state(
+        self,
+        profile: UserProfile,
+        *,
+        active_flow: str | None,
+        active_card_id: str | None = None,
+        active_card_name: str | None = None,
+        pending_action_json: str | None = None,
+    ) -> None:
+        if self.conversation_state_repo is None:
+            return
+        await self.conversation_state_repo.upsert(
+            profile.telegram_user_id,
+            active_flow=active_flow,
+            active_card_id=active_card_id,
+            active_card_name=active_card_name,
+            pending_action_json=pending_action_json,
+        )
 
     @staticmethod
     def _apply_due_fallback(user_text: str, action: AgentAction) -> AgentAction:
@@ -890,6 +926,7 @@ class TaskOrchestrator:
 
     async def _finish_turn(self, profile: UserProfile, user_text: str, result: AgentResult) -> OrchestratorResult:
         action = result.action
+        active_flow, active_card_id, active_card_name = await self._state_context(profile)
         logger.info(
             "orchestrator: incoming action_type=%s reasoning=%r user_text=%r",
             action.action_type,
@@ -916,16 +953,50 @@ class TaskOrchestrator:
         elif action.action_type == "complete_card_by_text":
             action, success_text = await self._resolve_complete_card(profile, user_text, action)
 
+        resolved_card_id: str | None = None
+        resolved_card_name: str | None = None
+        resolution_confidence: float | None = None
+        if action.action_type in {
+            "update_card",
+            "delete_card",
+            "move_card",
+            "create_checklist_item",
+            "attach_file",
+            "add_comment",
+        } and not action.card_id:
+            resolution = await self.card_resolver.resolve_for_action(
+                profile=profile,
+                user_text=user_text,
+                action=action,
+                active_card_id=active_card_id,
+                active_card_name=active_card_name,
+            )
+            action = resolution.action
+            resolved_card_id = resolution.resolved_card_id
+            resolved_card_name = resolution.resolved_card_name
+            resolution_confidence = resolution.confidence
+
         if action.action_type == "ask_for_clarification" and action.question:
             await self.clarification_repo.upsert(
                 profile.telegram_user_id,
                 action.question,
                 action.model_dump_json(),
             )
+            await self._persist_state(
+                profile,
+                active_flow=str((action.metadata or {}).get("after_clarification") or active_flow or "ask_for_clarification"),
+                active_card_id=active_card_id,
+                active_card_name=active_card_name,
+                pending_action_json=action.model_dump_json(),
+            )
             return OrchestratorResult(
                 action.question,
                 action_type=action.action_type,
                 action_payload=action.model_dump(mode="json"),
+                flow_status="clarification",
+                resolved_card_id=resolved_card_id,
+                resolved_card_name=resolved_card_name,
+                resolution_confidence=resolution_confidence,
             )
 
         if action.action_type == "set_persona":
@@ -936,6 +1007,7 @@ class TaskOrchestrator:
                     f"Режим ассистента переключен на: {persona}.",
                     action_type=action.action_type,
                     action_payload=action.model_dump(mode="json"),
+                    flow_status="completed",
                 )
 
         if action.action_type == "none":
@@ -943,13 +1015,27 @@ class TaskOrchestrator:
                 result.response_text,
                 action_type=action.action_type,
                 action_payload=action.model_dump(mode="json"),
+                flow_status="completed",
             )
 
         await self._execute_action(profile, action)
+        current_card_id = action.card_id or resolved_card_id or active_card_id
+        current_card_name = action.card_name or resolved_card_name or active_card_name
+        await self._persist_state(
+            profile,
+            active_flow=None,
+            active_card_id=current_card_id,
+            active_card_name=current_card_name,
+            pending_action_json=None,
+        )
         return OrchestratorResult(
             success_text or result.response_text,
             action_type=action.action_type,
             action_payload=action.model_dump(mode="json"),
+            flow_status="completed",
+            resolved_card_id=current_card_id,
+            resolved_card_name=current_card_name,
+            resolution_confidence=resolution_confidence,
         )
 
     @staticmethod
@@ -1388,6 +1474,25 @@ class TaskOrchestrator:
                 await self._execute_action(profile, resolved)
                 return OrchestratorResult("Готово, карточку обновил.")
 
+            if after == "pick_card_for_action":
+                candidates = list(meta.get("candidates") or [])
+                if candidates and not self._looks_like_new_command(text):
+                    chosen = self._pick_complete_card_candidate(candidates, text)
+                    if chosen is not None:
+                        resume = meta.get("resume_action") or {}
+                        if isinstance(resume, dict):
+                            resumed = AgentAction.model_validate(resume)
+                            resumed = resumed.model_copy(update={"card_id": str(chosen.get("card_id") or "")})
+                            await self._execute_action(profile, resumed)
+                            return OrchestratorResult(f"Готово, выполнил действие для карточки «{chosen.get('card_name')}».")
+                question = str(pending.question or "Выберите номер карточки из списка.")
+                await self.clarification_repo.upsert(
+                    telegram_user_id=profile.telegram_user_id,
+                    question=question,
+                    draft_action_json=json.dumps(draft, ensure_ascii=False),
+                )
+                return OrchestratorResult(question)
+
             if after == "complete_task":
                 candidates = list(meta.get("candidates") or [])
                 # Если в pending есть кандидаты И пользователь похож на «выбрал номер/имя» —
@@ -1610,6 +1715,10 @@ class TaskOrchestrator:
                 due_complete=action.due_complete,
                 position=action.position,
             )
+            if isinstance(card, dict) and card.get("id"):
+                action.card_id = str(card.get("id"))
+                if card.get("name"):
+                    action.card_name = str(card.get("name"))
             # Use-case 2: если в этом же действии есть пункты чеклиста — добавляем их.
             items = _split_checklist_items(action.checklist_item)
             if items and isinstance(card, dict) and card.get("id"):
@@ -1621,7 +1730,7 @@ class TaskOrchestrator:
                     await self.trello_client.add_check_item(checklist["id"], item)
         elif action.action_type == "update_card":
             if not action.card_id:
-                raise OrchestratorValidationError("Нужен card_id для обновления карточки.")
+                raise OrchestratorValidationError("Уточните, какую карточку нужно обновить.")
             has_patch = (
                 action.card_name is not None
                 or action.card_description is not None
@@ -1645,18 +1754,18 @@ class TaskOrchestrator:
             )
         elif action.action_type == "delete_card":
             if not action.card_id:
-                raise OrchestratorValidationError("Нужен card_id для удаления карточки.")
+                raise OrchestratorValidationError("Уточните, какую карточку нужно удалить.")
             await self.trello_client.delete_card(action.card_id)
         elif action.action_type == "move_card":
             if not action.card_id:
-                raise OrchestratorValidationError("Нужен card_id для перемещения карточки.")
+                raise OrchestratorValidationError("Уточните, какую карточку нужно переместить.")
             target_id = lists_map.get((action.list_name or "").lower())
             if not target_id:
                 raise OrchestratorValidationError("Не удалось определить целевой статус (колонку).")
             await self.trello_client.move_card(action.card_id, target_id)
         elif action.action_type == "create_checklist_item":
             if not action.card_id or not action.checklist_item:
-                raise OrchestratorValidationError("Нужны card_id и текст пункта чеклиста.")
+                raise OrchestratorValidationError("Уточните карточку и текст пункта чеклиста.")
             parts = _split_checklist_items(action.checklist_item)
             if not parts:
                 raise OrchestratorValidationError("Пустой пункт чеклиста.")
@@ -1665,11 +1774,11 @@ class TaskOrchestrator:
                 await self.trello_client.add_check_item(checklist["id"], part)
         elif action.action_type == "attach_file":
             if not action.card_id or not action.file_url:
-                raise OrchestratorValidationError("Нужны card_id и ссылка на файл.")
+                raise OrchestratorValidationError("Уточните карточку и ссылку на файл.")
             await self.trello_client.attach_file_by_url(action.card_id, action.file_url)
         elif action.action_type == "add_comment":
             if not action.card_id or not action.comment_text:
-                raise OrchestratorValidationError("Нужны card_id и текст комментария (comment_text).")
+                raise OrchestratorValidationError("Уточните карточку и текст комментария.")
             await self.trello_client.add_card_comment(action.card_id, action.comment_text)
         elif action.action_type == "add_card_label":
             if not action.card_id or not action.label_id:
@@ -1704,3 +1813,11 @@ class TaskOrchestrator:
                 complete=action.check_item_complete,
                 name=action.check_item_new_name,
             )
+
+        await self._persist_state(
+            profile,
+            active_flow=None,
+            active_card_id=action.card_id,
+            active_card_name=action.card_name,
+            pending_action_json=None,
+        )

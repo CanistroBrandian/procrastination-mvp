@@ -49,5 +49,26 @@ class IntentHistory(Base):
     user_text: Mapped[str] = mapped_column(Text)
     action_type: Mapped[str] = mapped_column(String(64))
     action_payload_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_card_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resolved_card_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    flow_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    resolution_confidence: Mapped[str | None] = mapped_column(String(32), nullable=True)
     response_text: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ConversationState(Base):
+    __tablename__ = "conversation_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    active_flow: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    active_card_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    active_card_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    pending_action_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    missing_slots_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    candidate_cards_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    candidate_items_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    flow_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

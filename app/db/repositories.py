@@ -3,7 +3,7 @@ import json
 from sqlalchemy import delete, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import IntentHistory, PendingClarification, UserProfile
+from app.db.models import ConversationState, IntentHistory, PendingClarification, UserProfile
 
 
 class UserProfileRepository:
@@ -73,6 +73,10 @@ class IntentHistoryRepository:
         action_type: str,
         response_text: str,
         action_payload_json: str | None = None,
+        resolved_card_id: str | None = None,
+        resolved_card_name: str | None = None,
+        flow_id: str | None = None,
+        resolution_confidence: str | None = None,
     ) -> None:
         self.session.add(
             IntentHistory(
@@ -81,6 +85,10 @@ class IntentHistoryRepository:
                 action_type=action_type,
                 response_text=response_text,
                 action_payload_json=action_payload_json,
+                resolved_card_id=resolved_card_id,
+                resolved_card_name=resolved_card_name,
+                flow_id=flow_id,
+                resolution_confidence=resolution_confidence,
             ),
         )
         await self.session.commit()
@@ -142,3 +150,56 @@ class IntentHistoryRepository:
             if s:
                 chunks.append(f"{k}={s}")
         return ", ".join(chunks)
+
+
+_UNSET = object()
+
+
+class ConversationStateRepository:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def get(self, telegram_user_id: int) -> ConversationState | None:
+        result = await self.session.execute(
+            select(ConversationState).where(ConversationState.telegram_user_id == telegram_user_id),
+        )
+        return result.scalar_one_or_none()
+
+    async def upsert(
+        self,
+        telegram_user_id: int,
+        *,
+        active_flow: str | None | object = _UNSET,
+        active_card_id: str | None | object = _UNSET,
+        active_card_name: str | None | object = _UNSET,
+        pending_action_json: str | None | object = _UNSET,
+        missing_slots_json: str | None | object = _UNSET,
+        candidate_cards_json: str | None | object = _UNSET,
+        candidate_items_json: str | None | object = _UNSET,
+        flow_id: str | None | object = _UNSET,
+    ) -> ConversationState:
+        state = await self.get(telegram_user_id)
+        if state is None:
+            state = ConversationState(telegram_user_id=telegram_user_id)
+            self.session.add(state)
+
+        if active_flow is not _UNSET:
+            state.active_flow = active_flow  # type: ignore[assignment]
+        if active_card_id is not _UNSET:
+            state.active_card_id = active_card_id  # type: ignore[assignment]
+        if active_card_name is not _UNSET:
+            state.active_card_name = active_card_name  # type: ignore[assignment]
+        if pending_action_json is not _UNSET:
+            state.pending_action_json = pending_action_json  # type: ignore[assignment]
+        if missing_slots_json is not _UNSET:
+            state.missing_slots_json = missing_slots_json  # type: ignore[assignment]
+        if candidate_cards_json is not _UNSET:
+            state.candidate_cards_json = candidate_cards_json  # type: ignore[assignment]
+        if candidate_items_json is not _UNSET:
+            state.candidate_items_json = candidate_items_json  # type: ignore[assignment]
+        if flow_id is not _UNSET:
+            state.flow_id = flow_id  # type: ignore[assignment]
+
+        await self.session.commit()
+        await self.session.refresh(state)
+        return state

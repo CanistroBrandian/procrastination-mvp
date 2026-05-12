@@ -24,6 +24,7 @@ from app.core.errors import (
 from app.db.models import Persona
 from app.db.repositories import (
     ClarificationRepository,
+    ConversationStateRepository,
     IntentHistoryRepository,
     UserProfileRepository,
 )
@@ -94,6 +95,7 @@ async def process_telegram_update(
     tg_client = TelegramClient(settings.telegram_bot_token)
     profile_repo = UserProfileRepository(db)
     clarification_repo = ClarificationRepository(db)
+    conversation_state_repo = ConversationStateRepository(db)
     intent_history_repo = IntentHistoryRepository(db)
     profile = await profile_repo.get_or_create(user_id)
     trello_client = TrelloClient(settings.trello_api_key, profile.trello_token or settings.trello_api_token)
@@ -101,6 +103,7 @@ async def process_telegram_update(
         agent_service=AgentService(client=openai_client, model=settings.chat_model),
         trello_client=trello_client,
         clarification_repo=clarification_repo,
+        conversation_state_repo=conversation_state_repo,
     )
 
     text = _get_text(update)
@@ -295,6 +298,12 @@ async def process_telegram_update(
                 action_type=action_type,
                 response_text=result.text,
                 action_payload_json=action_payload_json,
+                resolved_card_id=result.resolved_card_id,
+                resolved_card_name=result.resolved_card_name,
+                flow_id=result.flow_id,
+                resolution_confidence=(
+                    f"{result.resolution_confidence:.3f}" if result.resolution_confidence is not None else None
+                ),
             )
         except Exception:  # noqa: BLE001
             logger.exception("intent history append failed for user_id=%s", profile.telegram_user_id)
