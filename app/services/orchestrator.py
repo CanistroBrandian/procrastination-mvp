@@ -464,6 +464,8 @@ class TaskOrchestrator:
         if not profile.trello_board_id:
             return action, None
 
+        _, active_card_id, _ = await self._state_context(profile)
+
         old_name, new_name = _extract_rename_pair_from_text(user_text)
         updated = action
         if new_name:
@@ -473,6 +475,15 @@ class TaskOrchestrator:
         query = old_name or source_hint
         if not query and updated.card_name and not new_name:
             query = updated.card_name.strip()
+
+        # «Переименуй задачу на «Новое»» без пары «старое → новое» — целевая карточка из контекста диалога.
+        if (
+            active_card_id
+            and not old_name
+            and updated.card_name
+            and "переимен" in (user_text or "").lower()
+        ):
+            return updated.model_copy(update={"card_id": active_card_id}), None
 
         if not query:
             question = (

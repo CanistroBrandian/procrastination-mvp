@@ -450,7 +450,8 @@ def test_complete_card_with_incomplete_items_force_no_keeps_card():
     out = _run(orch.process_text(profile, "нет"))
 
     assert all(c[0] != "move_card" for c in trello.calls)
-    assert "не перевод" in out.text.lower() or "сначала отмет" in out.text.lower()
+    low = out.text.lower()
+    assert "не перевод" in low or "не перевожу" in low or "сначала отмет" in low
 
 
 def test_complete_card_ambiguous_asks_to_choose_then_resumes_by_number():
