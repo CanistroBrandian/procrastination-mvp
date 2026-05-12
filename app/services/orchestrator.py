@@ -180,6 +180,24 @@ def _checklist_add_card_search_queries(user_text: str, action: AgentAction) -> l
     return out
 
 
+def _extract_rename_pair_from_text(text: str) -> tuple[str | None, str | None]:
+    s = _normalize_guillemets_for_inference(text or "")
+    if not s:
+        return None, None
+    patterns = (
+        r"переимен\w*.*?«([^»]{2,160})».*?\b(?:на|в)\b[^«»\"]*«([^»]{2,160})»",
+        r"переимен\w*.*?\"([^\"]{2,160})\".*?\b(?:на|в)\b[^\"«»]*\"([^\"]{2,160})\"",
+    )
+    for pat in patterns:
+        m = re.search(pat, s, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            old_name = m.group(1).strip()
+            new_name = m.group(2).strip()
+            if old_name and new_name:
+                return old_name, new_name
+    return None, None
+
+
 class TaskOrchestrator:
     def __init__(
         self,
@@ -392,6 +410,115 @@ class TaskOrchestrator:
                         "candidates": cands,
                     },
                 }
+            ),
+            None,
+        )
+
+    async def _resolve_update_card_target(
+        self,
+        profile: UserProfile,
+        user_text: str,
+        action: AgentAction,
+    ) -> tuple[AgentAction, str | None]:
+        """Resolve update_card without card_id by matching card name on board."""
+        if action.action_type != "update_card":
+            return action, None
+        if action.card_id:
+            return action, None
+        if not profile.trello_board_id:
+            return action, None
+
+        old_name, new_name = _extract_rename_pair_from_text(user_text)
+        updated = action
+        if new_name:
+            updated = updated.model_copy(update={"card_name": new_name})
+
+        source_hint = str((updated.metadata or {}).get("source_card_name") or "").strip()
+        query = old_name or source_hint
+        if not query and updated.card_name and not new_name:
+            query = updated.card_name.strip()
+
+        if not query:
+            question = (
+                "Уточните, какую карточку нужно изменить: назовите её название "
+                "(например: «План разработки приложения»)."
+            )
+            return (
+                updated.model_copy(
+                    update={
+                        "action_type": "ask_for_clarification",
+                        "question": question,
+                        "metadata": {
+                            **(updated.metadata or {}),
+                            "after_clarification": "update_card_pick_card",
+                            "pending_update_card_name": updated.card_name,
+                            "pending_update_card_description": updated.card_description,
+                            "pending_update_due": updated.due,
+                            "pending_update_start": updated.start,
+                            "pending_update_due_complete": updated.due_complete,
+                            "pending_update_closed": updated.closed,
+                        },
+                    },
+                ),
+                None,
+            )
+
+        lists_raw = await self.trello_client.list_lists(profile.trello_board_id)
+        payload = await self.trello_client.list_board_cards_with_checklists(profile.trello_board_id)
+        payload = drop_cards_in_archived_lists(payload, lists_raw)
+        cards = cards_from_payload(payload)
+        hits = await self._search_cards_hybrid(profile, query, cards)
+        winner = confident_unique_hit(hits)
+        if winner is not None:
+            return updated.model_copy(update={"card_id": winner.card_id}), None
+
+        if not hits:
+            question = (
+                f"Не нашёл карточку по запросу «{query}». "
+                "Уточните название карточки, которую нужно изменить."
+            )
+            return (
+                updated.model_copy(
+                    update={
+                        "action_type": "ask_for_clarification",
+                        "question": question,
+                        "metadata": {
+                            **(updated.metadata or {}),
+                            "after_clarification": "update_card_pick_card",
+                            "match_text": query,
+                            "pending_update_card_name": updated.card_name,
+                            "pending_update_card_description": updated.card_description,
+                            "pending_update_due": updated.due,
+                            "pending_update_start": updated.start,
+                            "pending_update_due_complete": updated.due_complete,
+                            "pending_update_closed": updated.closed,
+                        },
+                    },
+                ),
+                None,
+            )
+
+        cands = [{"card_id": h.card_id, "card_name": h.card_name} for h in hits[:5]]
+        listing = "\n".join(f"{i + 1}) {c['card_name']}" for i, c in enumerate(cands))
+        question = f"Нашёл несколько карточек для «{query}». Выберите номер:\n{listing}"
+        return (
+            updated.model_copy(
+                update={
+                    "action_type": "ask_for_clarification",
+                    "question": question,
+                    "metadata": {
+                        **(updated.metadata or {}),
+                        "after_clarification": "update_card_pick_card",
+                        "match_text": query,
+                        "candidates": cands,
+                        "pending_update_card_name": updated.card_name,
+                        "pending_update_card_description": updated.card_description,
+                        "pending_update_due": updated.due,
+                        "pending_update_start": updated.start,
+                        "pending_update_due_complete": updated.due_complete,
+                        "pending_update_closed": updated.closed,
+                    },
+                },
             ),
             None,
         )
@@ -779,6 +906,10 @@ class TaskOrchestrator:
                 success_text = st
 
         action = self._ensure_checklist_has_card_or_ask(user_text, action)
+        if action.action_type == "update_card" and not action.card_id:
+            action, st = await self._resolve_update_card_target(profile, user_text, action)
+            if st:
+                success_text = st
 
         if action.action_type == "complete_task_from_text":
             action, success_text = await self._resolve_complete_task(profile, user_text, action)
@@ -1216,6 +1347,46 @@ class TaskOrchestrator:
                 resume = self._create_card_resume_prompt(meta, text)
                 result = await infer(resume, forced_intent="create_card")
                 return await self._finish_turn(profile, resume, result)
+
+            if after == "update_card_pick_card":
+                candidates = list(meta.get("candidates") or [])
+                if candidates and not self._looks_like_new_command(text):
+                    chosen = self._pick_complete_card_candidate(candidates, text)
+                    if chosen is not None:
+                        action = AgentAction(
+                            action_type="update_card",
+                            card_id=str(chosen.get("card_id") or ""),
+                            card_name=(meta.get("pending_update_card_name") if meta.get("pending_update_card_name") is not None else None),
+                            card_description=(meta.get("pending_update_card_description") if meta.get("pending_update_card_description") is not None else None),
+                            due=(meta.get("pending_update_due") if meta.get("pending_update_due") is not None else None),
+                            start=(meta.get("pending_update_start") if meta.get("pending_update_start") is not None else None),
+                            due_complete=(meta.get("pending_update_due_complete") if meta.get("pending_update_due_complete") is not None else None),
+                            closed=(meta.get("pending_update_closed") if meta.get("pending_update_closed") is not None else None),
+                        )
+                        await self._execute_action(profile, action)
+                        return OrchestratorResult(f"Обновил карточку «{chosen.get('card_name')}».")
+
+                source_hint = _infer_card_title_from_user_text(text) or text.strip()
+                retry = AgentAction(
+                    action_type="update_card",
+                    card_name=(meta.get("pending_update_card_name") if meta.get("pending_update_card_name") is not None else None),
+                    card_description=(meta.get("pending_update_card_description") if meta.get("pending_update_card_description") is not None else None),
+                    due=(meta.get("pending_update_due") if meta.get("pending_update_due") is not None else None),
+                    start=(meta.get("pending_update_start") if meta.get("pending_update_start") is not None else None),
+                    due_complete=(meta.get("pending_update_due_complete") if meta.get("pending_update_due_complete") is not None else None),
+                    closed=(meta.get("pending_update_closed") if meta.get("pending_update_closed") is not None else None),
+                    metadata={"source_card_name": source_hint},
+                )
+                resolved, _ = await self._resolve_update_card_target(profile, text, retry)
+                if resolved.action_type == "ask_for_clarification" and resolved.question:
+                    await self.clarification_repo.upsert(
+                        telegram_user_id=profile.telegram_user_id,
+                        question=resolved.question,
+                        draft_action_json=resolved.model_dump_json(),
+                    )
+                    return OrchestratorResult(resolved.question)
+                await self._execute_action(profile, resolved)
+                return OrchestratorResult("Готово, карточку обновил.")
 
             if after == "complete_task":
                 candidates = list(meta.get("candidates") or [])
