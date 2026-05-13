@@ -27,6 +27,10 @@ class UserProfile(Base):
     trello_done_list_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     persona: Mapped[Persona] = mapped_column(SqlEnum(Persona), default=Persona.MOM)
     reminder_cron: Mapped[str] = mapped_column(String(64), default="0 10 * * *")
+    timezone: Mapped[str] = mapped_column(String(64), default="Europe/Moscow")
+    routine_cron: Mapped[str] = mapped_column(String(64), default="0 8 * * *")
+    motivator_cron_windows: Mapped[str] = mapped_column(String(128), default="0 11,16,20 * * *")
+    analytics_cron: Mapped[str] = mapped_column(String(64), default="30 21 * * *")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -72,3 +76,30 @@ class ConversationState(Base):
     flow_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class RoutineTemplate(Base):
+    __tablename__ = "routine_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id: Mapped[int] = mapped_column(Integer, index=True)
+    name: Mapped[str] = mapped_column(String(256))
+    category_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    duration_min: Mapped[int] = mapped_column(Integer, default=60)
+    checklist_template_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    schedule_cron: Mapped[str] = mapped_column(String(64), default="0 8 * * *")
+    is_active: Mapped[int] = mapped_column(Integer, default=1)
+    last_generated_date: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class TaskEvent(Base):
+    __tablename__ = "task_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    telegram_user_id: Mapped[int] = mapped_column(Integer, index=True)
+    card_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    event_type: Mapped[str] = mapped_column(String(64))
+    category_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)

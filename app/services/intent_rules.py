@@ -130,6 +130,37 @@ MOVE_CARD_MARKERS: tuple[str, ...] = (
     "в работу задач",
 )
 
+SET_CATEGORY_MARKERS: tuple[str, ...] = (
+    "категори",
+    "category",
+    "пометь как",
+)
+
+CREATE_ROUTINE_MARKERS: tuple[str, ...] = (
+    "рутин",
+    "ежедневн",
+    "каждый день",
+    "шаблон рутины",
+)
+
+PAUSE_ROUTINE_MARKERS: tuple[str, ...] = (
+    "пауза рутин",
+    "останови рутин",
+    "выключи рутин",
+)
+
+RESUME_ROUTINE_MARKERS: tuple[str, ...] = (
+    "возобнови рутин",
+    "включи рутин",
+    "продолжи рутин",
+)
+
+LIST_ROUTINE_MARKERS: tuple[str, ...] = (
+    "список рутин",
+    "покажи рутины",
+    "какие рутины",
+)
+
 
 # ---------------------------------------------------------------- helpers
 
@@ -157,6 +188,17 @@ def quick_classify_intent(text: str) -> Intent | None:
 
     if _has_any(s, PERSONA_MARKERS):
         return "set_persona"
+
+    if _has_any(s, LIST_ROUTINE_MARKERS):
+        return "list_routine_templates"
+    if _has_any(s, PAUSE_ROUTINE_MARKERS):
+        return "pause_routine_template"
+    if _has_any(s, RESUME_ROUTINE_MARKERS):
+        return "resume_routine_template"
+    if _has_any(s, CREATE_ROUTINE_MARKERS):
+        return "create_routine_template"
+    if _has_any(s, SET_CATEGORY_MARKERS):
+        return "set_category"
 
     # ВАЖНО: закрытие проверяем РАНЬШЕ создания. Фраза «можно закрывать ЭТУ
     # ЗАДАЧУ» содержит «задача», но это не create.

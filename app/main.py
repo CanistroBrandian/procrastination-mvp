@@ -23,11 +23,14 @@ from app.api.webhook import router as webhook_router
 from app.core.config import get_settings
 from app.core.llm_client import build_async_openai_client
 from app.db.models import Base
-from app.db.repositories import UserProfileRepository
+from app.db.repositories import IntentHistoryRepository, RoutineTemplateRepository, TaskEventRepository, UserProfileRepository
 from app.db.session import SessionLocal, engine
 from app.integrations.telegram import TelegramClient
 from app.integrations.trello import TrelloClient
+from app.workers.analytics_report import run_daily_analytics_report
+from app.workers.motivator import run_overdue_motivator
 from app.workers.reminders import run_reminders
+from app.workers.routines import run_routine_generation
 from app.workers.telegram_polling import telegram_polling_loop
 
 scheduler = AsyncIOScheduler()
@@ -40,6 +43,36 @@ async def reminder_job() -> None:
     async with SessionLocal() as session:
         repo = UserProfileRepository(session)
         await run_reminders(repo, tg, trello)
+
+
+async def routine_generation_job() -> None:
+    cfg = get_settings()
+    trello = TrelloClient(cfg.trello_api_key, cfg.trello_api_token)
+    async with SessionLocal() as session:
+        profile_repo = UserProfileRepository(session)
+        routines_repo = RoutineTemplateRepository(session)
+        events_repo = TaskEventRepository(session)
+        await run_routine_generation(profile_repo, routines_repo, events_repo, trello)
+
+
+async def analytics_report_job() -> None:
+    cfg = get_settings()
+    tg = TelegramClient(cfg.telegram_bot_token)
+    async with SessionLocal() as session:
+        profile_repo = UserProfileRepository(session)
+        events_repo = TaskEventRepository(session)
+        await run_daily_analytics_report(profile_repo, events_repo, tg)
+
+
+async def overdue_motivator_job() -> None:
+    cfg = get_settings()
+    tg = TelegramClient(cfg.telegram_bot_token)
+    trello = TrelloClient(cfg.trello_api_key, cfg.trello_api_token)
+    async with SessionLocal() as session:
+        profile_repo = UserProfileRepository(session)
+        events_repo = TaskEventRepository(session)
+        history_repo = IntentHistoryRepository(session)
+        await run_overdue_motivator(profile_repo, events_repo, history_repo, tg, trello)
 
 
 def _cron_kwargs(expr: str) -> dict[str, str]:
@@ -92,6 +125,27 @@ async def lifespan(_: FastAPI):
             id="reminders",
             replace_existing=True,
             **_cron_kwargs(cfg.reminder_cron),
+        )
+        scheduler.add_job(
+            routine_generation_job,
+            "cron",
+            id="routine_generation",
+            replace_existing=True,
+            **_cron_kwargs(cfg.routine_worker_cron),
+        )
+        scheduler.add_job(
+            overdue_motivator_job,
+            "cron",
+            id="overdue_motivator",
+            replace_existing=True,
+            **_cron_kwargs(cfg.motivator_worker_cron),
+        )
+        scheduler.add_job(
+            analytics_report_job,
+            "cron",
+            id="daily_analytics_report",
+            replace_existing=True,
+            **_cron_kwargs(cfg.analytics_worker_cron),
         )
         scheduler.start()
     yield

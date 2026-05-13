@@ -18,6 +18,11 @@ ActionType = Literal[
     "add_card_member",
     "remove_card_member",
     "attach_file",
+    "set_category",
+    "create_routine_template",
+    "pause_routine_template",
+    "resume_routine_template",
+    "list_routine_templates",
     "ask_for_clarification",
     "set_persona",
     "link_board",
@@ -51,9 +56,13 @@ class AgentAction(BaseModel):
     comment_text: str | None = None
     label_id: str | None = None
     member_id: str | None = None
+    category_key: str | None = None
     # Для complete_task_from_text — что пользователь утверждает, что выполнил.
     match_text: str | None = None
     file_url: str | None = None
+    routine_name: str | None = None
+    routine_cron: str | None = None
+    routine_duration_min: int | None = None
     question: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -94,6 +103,9 @@ class AgentAction(BaseModel):
         "comment_text",
         "match_text",
         "question",
+        "category_key",
+        "routine_name",
+        "routine_cron",
         mode="before",
     )
     @classmethod
@@ -115,6 +127,27 @@ class AgentAction(BaseModel):
                 return True
             if low in ("false", "0", "no", "нет"):
                 return False
+        return None
+
+    @field_validator("routine_duration_min", mode="before")
+    @classmethod
+    def coerce_optional_int(cls, v: Any) -> int | None:
+        if v is None:
+            return None
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return v
+        if isinstance(v, float):
+            return int(v)
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            try:
+                return int(float(s))
+            except ValueError:
+                return None
         return None
 
     @field_validator("position", mode="before")

@@ -1,9 +1,17 @@
 import json
+from datetime import datetime, timedelta
 
 from sqlalchemy import delete, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import ConversationState, IntentHistory, PendingClarification, UserProfile
+from app.db.models import (
+    ConversationState,
+    IntentHistory,
+    PendingClarification,
+    RoutineTemplate,
+    TaskEvent,
+    UserProfile,
+)
 
 
 class UserProfileRepository:
@@ -121,6 +129,15 @@ class IntentHistoryRepository:
             return None
         return "Recent user intent history:\n" + "\n".join(lines[-8:])
 
+    async def last_activity_at(self, telegram_user_id: int) -> datetime | None:
+        result = await self.session.execute(
+            select(IntentHistory.created_at)
+            .where(IntentHistory.telegram_user_id == telegram_user_id)
+            .order_by(desc(IntentHistory.created_at))
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
     @staticmethod
     def _brief_payload(raw: str | None) -> str:
         if not raw:
@@ -203,3 +220,142 @@ class ConversationStateRepository:
         await self.session.commit()
         await self.session.refresh(state)
         return state
+
+
+class RoutineTemplateRepository:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def list_for_user(self, telegram_user_id: int) -> list[RoutineTemplate]:
+        result = await self.session.execute(
+            select(RoutineTemplate)
+            .where(RoutineTemplate.telegram_user_id == telegram_user_id)
+            .order_by(desc(RoutineTemplate.created_at)),
+        )
+        return list(result.scalars().all())
+
+    async def list_active(self) -> list[RoutineTemplate]:
+        result = await self.session.execute(
+            select(RoutineTemplate).where(RoutineTemplate.is_active == 1),
+        )
+        return list(result.scalars().all())
+
+    async def get_by_name(self, telegram_user_id: int, name: str) -> RoutineTemplate | None:
+        result = await self.session.execute(
+            select(RoutineTemplate)
+            .where(RoutineTemplate.telegram_user_id == telegram_user_id)
+            .where(RoutineTemplate.name == name)
+            .limit(1),
+        )
+        return result.scalar_one_or_none()
+
+    async def create_or_update(
+        self,
+        *,
+        telegram_user_id: int,
+        name: str,
+        category_key: str | None,
+        duration_min: int,
+        checklist_template_json: str | None,
+        schedule_cron: str,
+    ) -> RoutineTemplate:
+        row = await self.get_by_name(telegram_user_id, name)
+        if row is None:
+            row = RoutineTemplate(
+                telegram_user_id=telegram_user_id,
+                name=name,
+                category_key=category_key,
+                duration_min=duration_min,
+                checklist_template_json=checklist_template_json,
+                schedule_cron=schedule_cron,
+                is_active=1,
+            )
+            self.session.add(row)
+        else:
+            row.category_key = category_key
+            row.duration_min = duration_min
+            row.checklist_template_json = checklist_template_json
+            row.schedule_cron = schedule_cron
+            row.is_active = 1
+        await self.session.commit()
+        await self.session.refresh(row)
+        return row
+
+    async def set_active(self, telegram_user_id: int, name: str, is_active: bool) -> RoutineTemplate | None:
+        row = await self.get_by_name(telegram_user_id, name)
+        if row is None:
+            return None
+        row.is_active = 1 if is_active else 0
+        await self.session.commit()
+        await self.session.refresh(row)
+        return row
+
+    async def mark_generated(self, template_id: int, date_yyyy_mm_dd: str) -> None:
+        result = await self.session.execute(
+            select(RoutineTemplate).where(RoutineTemplate.id == template_id).limit(1),
+        )
+        row = result.scalar_one_or_none()
+        if row is None:
+            return
+        row.last_generated_date = date_yyyy_mm_dd
+        await self.session.commit()
+
+
+class TaskEventRepository:
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    async def append(
+        self,
+        *,
+        telegram_user_id: int,
+        card_id: str | None,
+        event_type: str,
+        category_key: str | None = None,
+    ) -> None:
+        self.session.add(
+            TaskEvent(
+                telegram_user_id=telegram_user_id,
+                card_id=card_id,
+                event_type=event_type,
+                category_key=category_key,
+            ),
+        )
+        await self.session.commit()
+
+    async def count_between(
+        self,
+        *,
+        telegram_user_id: int,
+        event_type: str,
+        start: datetime,
+        end: datetime,
+    ) -> int:
+        result = await self.session.execute(
+            select(TaskEvent.id)
+            .where(TaskEvent.telegram_user_id == telegram_user_id)
+            .where(TaskEvent.event_type == event_type)
+            .where(TaskEvent.created_at >= start)
+            .where(TaskEvent.created_at < end),
+        )
+        return len(result.scalars().all())
+
+    async def count_today_by_type(self, *, telegram_user_id: int, event_type: str, now: datetime) -> int:
+        day_start = datetime(now.year, now.month, now.day)
+        day_end = day_start + timedelta(days=1)
+        return await self.count_between(
+            telegram_user_id=telegram_user_id,
+            event_type=event_type,
+            start=day_start,
+            end=day_end,
+        )
+
+    async def last_event_at(self, *, telegram_user_id: int, event_type: str) -> datetime | None:
+        result = await self.session.execute(
+            select(TaskEvent.created_at)
+            .where(TaskEvent.telegram_user_id == telegram_user_id)
+            .where(TaskEvent.event_type == event_type)
+            .order_by(desc(TaskEvent.created_at))
+            .limit(1),
+        )
+        return result.scalar_one_or_none()

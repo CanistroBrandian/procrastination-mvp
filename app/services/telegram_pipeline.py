@@ -27,6 +27,8 @@ from app.db.repositories import (
     ClarificationRepository,
     ConversationStateRepository,
     IntentHistoryRepository,
+    RoutineTemplateRepository,
+    TaskEventRepository,
     UserProfileRepository,
 )
 from app.integrations.telegram import TelegramClient
@@ -40,6 +42,7 @@ from app.services.active_cards import (
 )
 from app.services.agent import AgentService
 from app.services.asr import build_transcription_service
+from app.services.categories import list_categories_for_user
 from app.services.onboarding import OnboardingService
 from app.services.orchestrator import TaskOrchestrator
 from app.services.intent_rules import quick_classify_intent
@@ -111,6 +114,8 @@ async def process_telegram_update(
     clarification_repo = ClarificationRepository(db)
     conversation_state_repo = ConversationStateRepository(db)
     intent_history_repo = IntentHistoryRepository(db)
+    routine_template_repo = RoutineTemplateRepository(db)
+    task_event_repo = TaskEventRepository(db)
     profile = await profile_repo.get_or_create(user_id)
     trello_client = TrelloClient(settings.trello_api_key, profile.trello_token or settings.trello_api_token)
     orchestrator = TaskOrchestrator(
@@ -118,6 +123,8 @@ async def process_telegram_update(
         trello_client=trello_client,
         clarification_repo=clarification_repo,
         conversation_state_repo=conversation_state_repo,
+        routine_template_repo=routine_template_repo,
+        task_event_repo=task_event_repo,
     )
 
     text = _get_text(update)
@@ -170,6 +177,9 @@ async def process_telegram_update(
             return
         preview = "\n".join([f"- {b['name']}: `{b['id']}`" for b in boards[:10]])
         await tg_client.send_message(chat_id, f"Доски:\n{preview}\n\nПривязка: /link <board_id>")
+        return
+    if text and text.strip() == "/categories":
+        await tg_client.send_message(chat_id, list_categories_for_user())
         return
 
     pending = await clarification_repo.get(profile.telegram_user_id)

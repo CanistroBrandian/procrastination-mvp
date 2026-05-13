@@ -23,6 +23,13 @@ class Settings(BaseSettings):
     trello_api_token: str = ""
     default_trello_board_id: str = ""
     reminder_cron: str = "*/30 * * * *"
+    default_user_timezone: str = "Europe/Moscow"
+    default_routine_cron: str = "0 8 * * *"
+    default_motivator_cron_windows: str = "0 11,16,20 * * *"
+    default_analytics_cron: str = "30 21 * * *"
+    routine_worker_cron: str = "*/10 * * * *"
+    motivator_worker_cron: str = "*/10 * * * *"
+    analytics_worker_cron: str = "*/10 * * * *"
 
 
 def get_settings() -> Settings:

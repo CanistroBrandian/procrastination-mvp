@@ -12,7 +12,12 @@ from app.core.errors import BoardNotLinkedError, OrchestratorValidationError
 
 logger = logging.getLogger(__name__)
 from app.db.models import Persona, UserProfile
-from app.db.repositories import ClarificationRepository, ConversationStateRepository
+from app.db.repositories import (
+    ClarificationRepository,
+    ConversationStateRepository,
+    RoutineTemplateRepository,
+    TaskEventRepository,
+)
 from app.integrations.trello import TrelloClient
 from app.schemas.actions import AgentAction, AgentResult
 from app.services.agent import AgentService
@@ -23,6 +28,7 @@ from app.services.card_search import (
     format_cards_for_search,
     merge_search_results,
 )
+from app.services.categories import CategoryService, list_categories_for_user, normalize_category_key
 from app.services.checklist_match import (
     CardRef,
     CheckItemRef,
@@ -35,6 +41,7 @@ from app.services.checklist_match import (
 )
 from app.services.date_infer import infer_due_iso_from_russian
 from app.services.intent_rules import quick_classify_intent
+from app.services.routines import RoutineCreatePayload, RoutineService
 from app.services.trello_board_filters import drop_cards_in_archived_lists
 
 
@@ -211,12 +218,47 @@ class TaskOrchestrator:
         trello_client: TrelloClient,
         clarification_repo: ClarificationRepository,
         conversation_state_repo: ConversationStateRepository | None = None,
+        routine_template_repo: RoutineTemplateRepository | None = None,
+        task_event_repo: TaskEventRepository | None = None,
     ):
         self.agent_service = agent_service
         self.trello_client = trello_client
         self.clarification_repo = clarification_repo
         self.conversation_state_repo = conversation_state_repo
+        self.routine_template_repo = routine_template_repo
+        self.task_event_repo = task_event_repo
         self.card_resolver = CardResolver(trello_client=trello_client, agent_service=agent_service)
+        self.category_service = CategoryService(trello_client)
+        self.routine_service = (
+            RoutineService(routine_template_repo, trello_client)
+            if routine_template_repo is not None
+            else None
+        )
+
+    async def _append_task_event(
+        self,
+        profile: UserProfile,
+        *,
+        event_type: str,
+        card_id: str | None = None,
+        category_key: str | None = None,
+    ) -> None:
+        if self.task_event_repo is None:
+            return
+        try:
+            await self.task_event_repo.append(
+                telegram_user_id=profile.telegram_user_id,
+                card_id=card_id,
+                event_type=event_type,
+                category_key=category_key,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "task event append failed user=%s type=%s card=%s",
+                profile.telegram_user_id,
+                event_type,
+                card_id,
+            )
 
     async def _state_context(self, profile: UserProfile) -> tuple[str | None, str | None, str | None]:
         if self.conversation_state_repo is None:
@@ -244,6 +286,27 @@ class TaskOrchestrator:
             active_card_name=active_card_name,
             pending_action_json=pending_action_json,
         )
+
+    @staticmethod
+    def _extract_minutes_from_text(text: str) -> int | None:
+        s = (text or "").lower()
+        m = re.search(r"(\d{1,3})\s*(?:мин|минут|m)\b", s)
+        if not m:
+            m = re.search(r"(\d{1,2})\s*(?:час|ч)\b", s)
+            if m:
+                return int(m.group(1)) * 60
+            return None
+        return int(m.group(1))
+
+    @staticmethod
+    def _extract_quoted_value(text: str) -> str | None:
+        m = re.search(r"В«([^В»]{2,160})В»", text or "")
+        if m:
+            return m.group(1).strip()
+        m = re.search(r"\"([^\"]{2,160})\"", text or "")
+        if m:
+            return m.group(1).strip()
+        return None
 
     @staticmethod
     def _apply_due_fallback(user_text: str, action: AgentAction) -> AgentAction:
@@ -974,6 +1037,7 @@ class TaskOrchestrator:
             "create_checklist_item",
             "attach_file",
             "add_comment",
+            "set_category",
         } and not action.card_id:
             resolution = await self.card_resolver.resolve_for_action(
                 profile=profile,
@@ -1020,6 +1084,118 @@ class TaskOrchestrator:
                     action_payload=action.model_dump(mode="json"),
                     flow_status="completed",
                 )
+
+        if action.action_type == "set_category":
+            category_key = normalize_category_key(action.category_key) or normalize_category_key(user_text)
+            if not category_key:
+                return OrchestratorResult(
+                    f"Не понял категорию.\n{list_categories_for_user()}",
+                    action_type=action.action_type,
+                    action_payload=action.model_dump(mode="json"),
+                    flow_status="clarification",
+                )
+            target_card_id = action.card_id or resolved_card_id
+            target_card_name = action.card_name or resolved_card_name or active_card_name
+            if not target_card_id:
+                return OrchestratorResult(
+                    "Уточните карточку, для которой нужно сменить категорию.",
+                    action_type=action.action_type,
+                    action_payload=action.model_dump(mode="json"),
+                    flow_status="clarification",
+                )
+            await self.category_service.apply_category(profile, target_card_id, category_key)
+            await self._append_task_event(
+                profile,
+                event_type="updated",
+                card_id=target_card_id,
+                category_key=category_key,
+            )
+            await self._persist_state(
+                profile,
+                active_flow=None,
+                active_card_id=target_card_id,
+                active_card_name=target_card_name,
+                pending_action_json=None,
+            )
+            return OrchestratorResult(
+                f"Категория карточки «{target_card_name or target_card_id}» установлена: {category_key}.",
+                action_type=action.action_type,
+                action_payload=action.model_dump(mode="json"),
+                flow_status="completed",
+                resolved_card_id=target_card_id,
+                resolved_card_name=target_card_name,
+            )
+
+        if action.action_type == "create_routine_template":
+            if self.routine_service is None:
+                return OrchestratorResult(
+                    "Шаблоны рутин недоступны: не подключен репозиторий.",
+                    action_type=action.action_type,
+                    action_payload=action.model_dump(mode="json"),
+                    flow_status="clarification",
+                )
+            routine_name = (action.routine_name or action.card_name or self._extract_quoted_value(user_text) or "").strip()
+            if not routine_name:
+                return OrchestratorResult(
+                    "Уточните название шаблона рутины.",
+                    action_type=action.action_type,
+                    action_payload=action.model_dump(mode="json"),
+                    flow_status="clarification",
+                )
+            duration = action.routine_duration_min or self._extract_minutes_from_text(user_text) or 60
+            schedule_cron = (action.routine_cron or profile.routine_cron or "0 8 * * *").strip()
+            category_key = normalize_category_key(action.category_key)
+            items = _split_checklist_items(action.checklist_item)
+            template = await self.routine_service.create_or_update(
+                profile,
+                RoutineCreatePayload(
+                    name=routine_name,
+                    category_key=category_key,
+                    duration_min=max(1, duration),
+                    checklist_items=items,
+                    schedule_cron=schedule_cron,
+                ),
+            )
+            return OrchestratorResult(
+                f"Шаблон рутины «{template.name}» сохранен. Расписание: {template.schedule_cron}.",
+                action_type=action.action_type,
+                action_payload=action.model_dump(mode="json"),
+                flow_status="completed",
+            )
+
+        if action.action_type == "pause_routine_template":
+            if self.routine_service is None:
+                return OrchestratorResult("Рутины недоступны в текущей конфигурации.", action_type=action.action_type)
+            routine_name = (action.routine_name or self._extract_quoted_value(user_text) or "").strip()
+            if not routine_name:
+                return OrchestratorResult("Уточните название рутины для паузы.", action_type=action.action_type)
+            ok = await self.routine_service.pause(profile, routine_name)
+            if not ok:
+                return OrchestratorResult(f"Шаблон «{routine_name}» не найден.", action_type=action.action_type)
+            return OrchestratorResult(f"Шаблон «{routine_name}» поставлен на паузу.", action_type=action.action_type)
+
+        if action.action_type == "resume_routine_template":
+            if self.routine_service is None:
+                return OrchestratorResult("Рутины недоступны в текущей конфигурации.", action_type=action.action_type)
+            routine_name = (action.routine_name or self._extract_quoted_value(user_text) or "").strip()
+            if not routine_name:
+                return OrchestratorResult("Уточните название рутины для возобновления.", action_type=action.action_type)
+            ok = await self.routine_service.resume(profile, routine_name)
+            if not ok:
+                return OrchestratorResult(f"Шаблон «{routine_name}» не найден.", action_type=action.action_type)
+            return OrchestratorResult(f"Шаблон «{routine_name}» снова активен.", action_type=action.action_type)
+
+        if action.action_type == "list_routine_templates":
+            if self.routine_service is None:
+                return OrchestratorResult("Рутины недоступны в текущей конфигурации.", action_type=action.action_type)
+            rows = await self.routine_service.list_for_user(profile)
+            if not rows:
+                return OrchestratorResult("Шаблоны рутин пока не созданы.", action_type=action.action_type)
+            lines = []
+            for row in rows[:20]:
+                status = "active" if int(row.is_active or 0) == 1 else "paused"
+                lines.append(f"- {row.name} [{status}] cron={row.schedule_cron}")
+            return OrchestratorResult("Шаблоны рутин:\n" + "\n".join(lines), action_type=action.action_type)
 
         if action.action_type == "none":
             return OrchestratorResult(
@@ -1903,6 +2079,9 @@ class TaskOrchestrator:
             "doing": profile.trello_doing_list_id,
             "done": profile.trello_done_list_id,
         }
+        event_type: str | None = None
+        event_category: str | None = normalize_category_key(action.category_key)
+        moved_to_done = False
         if action.action_type == "create_card":
             list_key = (action.list_name or "inbox").lower()
             list_id = lists_map.get(list_key) or profile.trello_inbox_list_id
@@ -1930,6 +2109,9 @@ class TaskOrchestrator:
                 )
                 for item in items:
                     await self.trello_client.add_check_item(checklist["id"], item)
+            if action.card_id and event_category:
+                await self.category_service.apply_category(profile, action.card_id, event_category)
+            event_type = "created"
         elif action.action_type == "update_card":
             if not action.card_id:
                 raise OrchestratorValidationError("Уточните, какую карточку нужно обновить.")
@@ -1954,6 +2136,9 @@ class TaskOrchestrator:
                 due_complete=action.due_complete,
                 closed=action.closed,
             )
+            if event_category:
+                await self.category_service.apply_category(profile, action.card_id, event_category)
+            event_type = "updated"
         elif action.action_type == "delete_card":
             if not action.card_id:
                 raise OrchestratorValidationError("Уточните, какую карточку нужно удалить.")
@@ -1965,6 +2150,8 @@ class TaskOrchestrator:
             if not target_id:
                 raise OrchestratorValidationError("Не удалось определить целевой статус (колонку).")
             await self.trello_client.move_card(action.card_id, target_id)
+            event_type = "moved"
+            moved_to_done = bool(profile.trello_done_list_id and target_id == profile.trello_done_list_id)
         elif action.action_type == "create_checklist_item":
             if not action.card_id or not action.checklist_item:
                 raise OrchestratorValidationError("Уточните карточку и текст пункта чеклиста.")
@@ -2015,6 +2202,10 @@ class TaskOrchestrator:
                 complete=action.check_item_complete,
                 name=action.check_item_new_name,
             )
+            if action.check_item_complete is True:
+                event_type = "completed"
+            else:
+                event_type = "updated"
 
         await self._persist_state(
             profile,
@@ -2023,3 +2214,17 @@ class TaskOrchestrator:
             active_card_name=action.card_name,
             pending_action_json=None,
         )
+        if event_type:
+            await self._append_task_event(
+                profile,
+                event_type=event_type,
+                card_id=action.card_id,
+                category_key=event_category,
+            )
+        if moved_to_done:
+            await self._append_task_event(
+                profile,
+                event_type="completed",
+                card_id=action.card_id,
+                category_key=event_category,
+            )
