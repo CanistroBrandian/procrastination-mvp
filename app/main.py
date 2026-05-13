@@ -24,6 +24,7 @@ from app.core.config import get_settings
 from app.core.llm_client import build_async_openai_client
 from app.db.models import Base
 from app.db.repositories import IntentHistoryRepository, RoutineTemplateRepository, TaskEventRepository, UserProfileRepository
+from app.db.schema_upgrade import ensure_user_profile_compat_columns
 from app.db.session import SessionLocal, engine
 from app.integrations.telegram import TelegramClient
 from app.integrations.trello import TrelloClient
@@ -90,6 +91,7 @@ def _cron_kwargs(expr: str) -> dict[str, str]:
 async def lifespan(_: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await ensure_user_profile_compat_columns(conn)
 
     poll_stop = asyncio.Event()
     poll_task: asyncio.Task | None = None
