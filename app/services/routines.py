@@ -9,7 +9,7 @@ from app.db.models import RoutineTemplate, UserProfile
 from app.db.repositories import RoutineTemplateRepository
 from app.integrations.trello import TrelloClient
 from app.services.categories import normalize_category_key
-from app.services.cron_match import cron_matches_now
+from app.services.cron_match import cron_matches_window, normalize_cron_or_default
 
 
 @dataclass(frozen=True)
@@ -50,10 +50,19 @@ class RoutineService:
         return await self.repo.list_for_user(profile.telegram_user_id)
 
     @staticmethod
-    def should_run_template(template: RoutineTemplate, now_local: datetime) -> bool:
+    def should_run_template(
+        template: RoutineTemplate,
+        now_local: datetime,
+        *,
+        window_minutes: int = 0,
+        effective_cron: str | None = None,
+    ) -> bool:
         if int(template.is_active or 0) != 1:
             return False
-        if not cron_matches_now(template.schedule_cron or "", now_local):
+        cron_expr = (effective_cron or "").strip()
+        if not cron_expr:
+            cron_expr, _ = normalize_cron_or_default(template.schedule_cron, "0 8 * * *")
+        if not cron_matches_window(cron_expr, now_local, window_minutes=window_minutes):
             return False
         today = now_local.strftime("%Y-%m-%d")
         return (template.last_generated_date or "") != today
@@ -81,6 +90,9 @@ class RoutineService:
         if not profile.trello_inbox_list_id:
             return None
         today = now_local.strftime("%Y-%m-%d")
+        locked = await self.repo.mark_generated_if_not_date(template.id, today)
+        if not locked:
+            return None
         title = f"{template.name} — {today}"
         desc = f"Рутина на день: {template.duration_min} мин."
         card = await self.trello_client.create_card(profile.trello_inbox_list_id, title, desc=desc)
@@ -93,7 +105,6 @@ class RoutineService:
                 if cl_id:
                     for item in checklist:
                         await self.trello_client.add_check_item(cl_id, item)
-            await self.repo.mark_generated(template.id, today)
         return card
 
 

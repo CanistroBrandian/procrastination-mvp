@@ -6,6 +6,7 @@ import re
 import tempfile
 from collections import OrderedDict
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 from openai import AsyncOpenAI
@@ -85,6 +86,22 @@ def _extract_urls(text: str | None) -> list[str]:
         if cleaned and cleaned not in urls:
             urls.append(cleaned)
     return urls
+
+
+def _extract_trello_board_id(urls: list[str]) -> str | None:
+    for raw in urls:
+        try:
+            parsed = urlparse(raw)
+        except ValueError:
+            continue
+        if parsed.netloc.lower() not in {"trello.com", "www.trello.com", "m.trello.com"}:
+            continue
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) >= 2 and parts[0].lower() == "b":
+            board_id = parts[1].strip()
+            if board_id:
+                return board_id
+    return None
 
 
 async def process_telegram_update(
@@ -182,6 +199,24 @@ async def process_telegram_update(
         await tg_client.send_message(chat_id, list_categories_for_user())
         return
 
+    urls_from_text = _extract_urls(text)
+    board_id_from_url = _extract_trello_board_id(urls_from_text)
+    if board_id_from_url and (not text or not text.strip().startswith("/")):
+        try:
+            onboarding = OnboardingService(trello_client)
+            await onboarding.link_default_board(profile, board_id_from_url)
+            await clarification_repo.clear(profile.telegram_user_id)
+            await conversation_state_repo.upsert(
+                profile.telegram_user_id,
+                active_flow=None,
+                pending_action_json=None,
+            )
+            await profile_repo.save(profile)
+            await tg_client.send_message(chat_id, "Доска из ссылки подключена. Готов принимать задачи.")
+        except TrelloAPIError as exc:
+            await tg_client.send_message(chat_id, exc.user_message)
+        return
+
     pending = await clarification_repo.get(profile.telegram_user_id)
 
     if message.get("voice"):
@@ -197,6 +232,7 @@ async def process_telegram_update(
                 "сервера: одна без ключей, другая с ключами. Оставьте один процесс uvicorn.",
             )
             return
+        audio_path: Path | None = None
         try:
             file_id = message["voice"]["file_id"]
             file_path = await tg_client.get_file_path(file_id)
@@ -222,6 +258,12 @@ async def process_telegram_update(
                 f"Не удалось скачать голосовой файл с Telegram: {exc!s}",
             )
             return
+        finally:
+            if audio_path is not None:
+                try:
+                    audio_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Не удалось удалить временный voice-файл: %s", audio_path)
 
     if not text and not message.get("document"):
         await tg_client.send_message(chat_id, "Не понял сообщение. Отправь текст или голосовое.")

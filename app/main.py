@@ -28,6 +28,7 @@ from app.db.schema_upgrade import ensure_user_profile_compat_columns
 from app.db.session import SessionLocal, engine
 from app.integrations.telegram import TelegramClient
 from app.integrations.trello import TrelloClient
+from app.services.cron_match import cron_is_valid
 from app.workers.analytics_report import run_daily_analytics_report
 from app.workers.motivator import run_overdue_motivator
 from app.workers.reminders import run_reminders
@@ -53,7 +54,13 @@ async def routine_generation_job() -> None:
         profile_repo = UserProfileRepository(session)
         routines_repo = RoutineTemplateRepository(session)
         events_repo = TaskEventRepository(session)
-        await run_routine_generation(profile_repo, routines_repo, events_repo, trello)
+        await run_routine_generation(
+            profile_repo,
+            routines_repo,
+            events_repo,
+            trello,
+            default_routine_cron=(cfg.default_routine_cron or "0 8 * * *"),
+        )
 
 
 async def analytics_report_job() -> None:
@@ -62,7 +69,12 @@ async def analytics_report_job() -> None:
     async with SessionLocal() as session:
         profile_repo = UserProfileRepository(session)
         events_repo = TaskEventRepository(session)
-        await run_daily_analytics_report(profile_repo, events_repo, tg)
+        await run_daily_analytics_report(
+            profile_repo,
+            events_repo,
+            tg,
+            default_analytics_cron=(cfg.default_analytics_cron or "30 21 * * *"),
+        )
 
 
 async def overdue_motivator_job() -> None:
@@ -73,11 +85,27 @@ async def overdue_motivator_job() -> None:
         profile_repo = UserProfileRepository(session)
         events_repo = TaskEventRepository(session)
         history_repo = IntentHistoryRepository(session)
-        await run_overdue_motivator(profile_repo, events_repo, history_repo, tg, trello)
+        await run_overdue_motivator(
+            profile_repo,
+            events_repo,
+            history_repo,
+            tg,
+            trello,
+            default_motivator_cron=(cfg.default_motivator_cron_windows or "0 11,16,20 * * *"),
+        )
 
 
-def _cron_kwargs(expr: str) -> dict[str, str]:
-    minute, hour, day, month, day_of_week = expr.split()
+def _cron_kwargs(expr: str, *, default_expr: str, job_name: str) -> dict[str, str]:
+    raw = (expr or "").strip()
+    chosen = raw if cron_is_valid(raw) else default_expr.strip()
+    if chosen != raw:
+        logging.getLogger("uvicorn.error").warning(
+            "Invalid cron for %s: %r. Fallback to %r",
+            job_name,
+            expr,
+            chosen,
+        )
+    minute, hour, day, month, day_of_week = chosen.split()
     return {
         "minute": minute,
         "hour": hour,
@@ -126,28 +154,28 @@ async def lifespan(_: FastAPI):
             "cron",
             id="reminders",
             replace_existing=True,
-            **_cron_kwargs(cfg.reminder_cron),
+            **_cron_kwargs(cfg.reminder_cron, default_expr="*/30 * * * *", job_name="reminders"),
         )
         scheduler.add_job(
             routine_generation_job,
             "cron",
             id="routine_generation",
             replace_existing=True,
-            **_cron_kwargs(cfg.routine_worker_cron),
+            **_cron_kwargs(cfg.routine_worker_cron, default_expr="*/10 * * * *", job_name="routine_generation"),
         )
         scheduler.add_job(
             overdue_motivator_job,
             "cron",
             id="overdue_motivator",
             replace_existing=True,
-            **_cron_kwargs(cfg.motivator_worker_cron),
+            **_cron_kwargs(cfg.motivator_worker_cron, default_expr="*/10 * * * *", job_name="overdue_motivator"),
         )
         scheduler.add_job(
             analytics_report_job,
             "cron",
             id="daily_analytics_report",
             replace_existing=True,
-            **_cron_kwargs(cfg.analytics_worker_cron),
+            **_cron_kwargs(cfg.analytics_worker_cron, default_expr="*/10 * * * *", job_name="daily_analytics_report"),
         )
         scheduler.start()
     yield

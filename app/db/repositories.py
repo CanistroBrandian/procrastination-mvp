@@ -1,7 +1,8 @@
 import json
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
-from sqlalchemy import delete, desc, select
+from sqlalchemy import delete, desc, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import (
@@ -300,6 +301,22 @@ class RoutineTemplateRepository:
         row.last_generated_date = date_yyyy_mm_dd
         await self.session.commit()
 
+    async def mark_generated_if_not_date(self, template_id: int, date_yyyy_mm_dd: str) -> bool:
+        stmt = (
+            update(RoutineTemplate)
+            .where(RoutineTemplate.id == template_id)
+            .where(
+                or_(
+                    RoutineTemplate.last_generated_date.is_(None),
+                    RoutineTemplate.last_generated_date != date_yyyy_mm_dd,
+                )
+            )
+            .values(last_generated_date=date_yyyy_mm_dd)
+        )
+        result = await self.session.execute(stmt)
+        await self.session.commit()
+        return bool(getattr(result, "rowcount", 0))
+
 
 class TaskEventRepository:
     def __init__(self, session: AsyncSession):
@@ -348,6 +365,31 @@ class TaskEventRepository:
             event_type=event_type,
             start=day_start,
             end=day_end,
+        )
+
+    async def count_local_day_by_type(
+        self,
+        *,
+        telegram_user_id: int,
+        event_type: str,
+        now_utc: datetime,
+        tz_name: str,
+    ) -> int:
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo("UTC")
+        aware_utc = now_utc.replace(tzinfo=ZoneInfo("UTC")) if now_utc.tzinfo is None else now_utc.astimezone(ZoneInfo("UTC"))
+        local_now = aware_utc.astimezone(tz)
+        local_start = datetime(local_now.year, local_now.month, local_now.day, tzinfo=tz)
+        local_end = local_start + timedelta(days=1)
+        start_utc = local_start.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+        end_utc = local_end.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+        return await self.count_between(
+            telegram_user_id=telegram_user_id,
+            event_type=event_type,
+            start=start_utc,
+            end=end_utc,
         )
 
     async def last_event_at(self, *, telegram_user_id: int, event_type: str) -> datetime | None:

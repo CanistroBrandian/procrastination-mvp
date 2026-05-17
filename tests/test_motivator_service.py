@@ -19,8 +19,17 @@ class FakeEventsRepo:
     def __init__(self, sent_today: int = 0, last_ping: datetime | None = None) -> None:
         self.sent_today = sent_today
         self.last_ping = last_ping
+        self.last_tz_name: str | None = None
 
-    async def count_today_by_type(self, *, telegram_user_id: int, event_type: str, now: datetime):  # noqa: ARG002
+    async def count_local_day_by_type(
+        self,
+        *,
+        telegram_user_id: int,  # noqa: ARG002
+        event_type: str,
+        now_utc: datetime,  # noqa: ARG002
+        tz_name: str,  # noqa: ARG002
+    ):
+        self.last_tz_name = tz_name
         return self.sent_today if event_type == "motivator_ping" else 0
 
     async def last_event_at(self, *, telegram_user_id: int, event_type: str):  # noqa: ARG002
@@ -62,4 +71,4 @@ def test_motivator_anti_spam_limits():
         FakeHistoryRepo(last_user_activity=now - timedelta(hours=2)),
     )
     assert _run(svc_ok.can_ping_now(profile=profile, now_utc=now)) is True
-
+    assert svc_ok.events.last_tz_name == "Europe/Moscow"

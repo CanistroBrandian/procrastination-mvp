@@ -41,7 +41,7 @@ class TelegramClient:
             ) from exc
 
     async def send_message(self, chat_id: int, text: str) -> None:
-        await self._post("sendMessage", {"chat_id": chat_id, "text": text})
+        await self._post("sendMessage", {"chat_id": chat_id, "text": _normalize_mojibake(text)})
 
     async def set_webhook(self, url: str, secret_token: str) -> None:
         payload = {"url": url, "secret_token": secret_token, "drop_pending_updates": False}
@@ -90,3 +90,25 @@ class TelegramClient:
 
     def build_file_download_url(self, file_path: str) -> str:
         return f"{self.file_url}/{file_path}"
+
+
+def _normalize_mojibake(text: str) -> str:
+    """Best-effort fix for UTF-8/legacy encoding mojibake like 'РџС...'."""
+    if not text or not _looks_like_mojibake(text):
+        return text
+    for src, dst in (("latin-1", "utf-8"), ("cp1251", "utf-8"), ("cp1252", "utf-8")):
+        try:
+            candidate = text.encode(src).decode(dst)
+        except UnicodeError:
+            continue
+        if _mojibake_score(candidate) < _mojibake_score(text):
+            return candidate
+    return text
+
+
+def _looks_like_mojibake(text: str) -> bool:
+    return _mojibake_score(text) > 0
+
+
+def _mojibake_score(text: str) -> int:
+    return text.count("Р") + text.count("С") + text.count("вЂ") + text.count("Ð") + text.count("Ñ")

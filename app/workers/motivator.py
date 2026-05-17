@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import logging
 
 from sqlalchemy import select
 
@@ -9,9 +10,11 @@ from app.db.models import UserProfile
 from app.db.repositories import IntentHistoryRepository, TaskEventRepository, UserProfileRepository
 from app.integrations.telegram import TelegramClient
 from app.integrations.trello import TrelloClient
-from app.services.cron_match import cron_matches_now
 from app.services.motivator import MotivatorService, OverdueCard
 from app.services.trello_board_filters import drop_cards_in_archived_lists
+from app.services.cron_match import cron_matches_window, normalize_cron_or_default
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,9 @@ async def run_overdue_motivator(
     history_repo: IntentHistoryRepository,
     tg: TelegramClient,
     trello: TrelloClient,
+    *,
+    tick_minutes: int = 10,
+    default_motivator_cron: str = "0 11,16,20 * * *",
 ) -> None:
     session = profile_repo.session
     users_result = await session.execute(select(UserProfile))
@@ -53,7 +59,15 @@ async def run_overdue_motivator(
         if not profile.trello_board_id:
             continue
         now_local = motivator.now_in_profile_tz(profile)
-        if not cron_matches_now(profile.motivator_cron_windows or "", now_local):
+        effective_cron, fallback_used = normalize_cron_or_default(profile.motivator_cron_windows, default_motivator_cron)
+        if fallback_used:
+            logger.warning(
+                "invalid profile motivator_cron_windows for user=%s: %r, fallback=%r",
+                profile.telegram_user_id,
+                profile.motivator_cron_windows,
+                effective_cron,
+            )
+        if not cron_matches_window(effective_cron, now_local, window_minutes=tick_minutes):
             continue
         if not await motivator.can_ping_now(profile=profile, now_utc=now_utc):
             continue

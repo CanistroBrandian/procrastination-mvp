@@ -54,10 +54,12 @@ class MotivatorService:
         cooldown_minutes: int = 120,
         min_idle_minutes: int = 45,
     ) -> bool:
-        sent_today = await self.events.count_today_by_type(
+        tz_name = (profile.timezone or "").strip() or "Europe/Moscow"
+        sent_today = await self.events.count_local_day_by_type(
             telegram_user_id=profile.telegram_user_id,
             event_type="motivator_ping",
-            now=now_utc,
+            now_utc=now_utc,
+            tz_name=tz_name,
         )
         if sent_today >= max_per_day:
             return False

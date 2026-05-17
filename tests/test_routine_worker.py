@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from app.db.models import RoutineTemplate, UserProfile
+from app.workers import routines as routines_worker
 from app.workers.routines import run_routine_generation
 
 
@@ -48,6 +49,16 @@ class FakeRoutinesRepo:
         for t in self.templates:
             if t.id == template_id:
                 t.last_generated_date = date_yyyy_mm_dd
+
+    async def mark_generated_if_not_date(self, template_id: int, date_yyyy_mm_dd: str) -> bool:
+        for t in self.templates:
+            if t.id != template_id:
+                continue
+            if t.last_generated_date == date_yyyy_mm_dd:
+                return False
+            t.last_generated_date = date_yyyy_mm_dd
+            return True
+        return False
 
 
 class FakeTaskEvents:
@@ -107,3 +118,66 @@ def test_routine_worker_idempotent_per_day():
     assert second_count == 1
     assert any(ev[2] == "routine_generated" for ev in events.events)
 
+
+def test_routine_worker_matches_user_cron_in_tick_window(monkeypatch):
+    user = UserProfile(telegram_user_id=12, trello_board_id="B2", trello_inbox_list_id="L1", timezone="Europe/Moscow")
+    template = RoutineTemplate(
+        id=2,
+        telegram_user_id=12,
+        name="Daily standup note",
+        category_key=None,
+        duration_min=15,
+        checklist_template_json=None,
+        schedule_cron="7 * * * *",
+        is_active=1,
+        last_generated_date=None,
+    )
+    profile_repo = FakeProfileRepo([user])
+    routines_repo = FakeRoutinesRepo([template])
+    events = FakeTaskEvents()
+    trello = FakeTrello()
+
+    monkeypatch.setattr(
+        routines_worker,
+        "now_in_user_tz",
+        lambda profile, fallback_tz="Europe/Moscow": datetime(2026, 5, 14, 13, 10),
+    )
+
+    _run(run_routine_generation(profile_repo, routines_repo, events, trello, tick_minutes=10))
+
+    assert len(trello.created_cards) == 1
+
+
+def test_routine_worker_fallbacks_invalid_template_cron(monkeypatch):
+    user = UserProfile(
+        telegram_user_id=13,
+        trello_board_id="B3",
+        trello_inbox_list_id="L1",
+        timezone="Europe/Moscow",
+        routine_cron="* * * * *",
+    )
+    template = RoutineTemplate(
+        id=3,
+        telegram_user_id=13,
+        name="Invalid cron template",
+        category_key=None,
+        duration_min=10,
+        checklist_template_json=None,
+        schedule_cron="not-a-cron",
+        is_active=1,
+        last_generated_date=None,
+    )
+    profile_repo = FakeProfileRepo([user])
+    routines_repo = FakeRoutinesRepo([template])
+    events = FakeTaskEvents()
+    trello = FakeTrello()
+
+    monkeypatch.setattr(
+        routines_worker,
+        "now_in_user_tz",
+        lambda profile, fallback_tz="Europe/Moscow": datetime(2026, 5, 14, 13, 10),
+    )
+
+    _run(run_routine_generation(profile_repo, routines_repo, events, trello, tick_minutes=10))
+
+    assert len(trello.created_cards) == 1

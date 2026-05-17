@@ -9,6 +9,7 @@ from app.db.models import UserProfile
 from app.db.repositories import RoutineTemplateRepository, TaskEventRepository, UserProfileRepository
 from app.integrations.trello import TrelloClient
 from app.services.categories import CategoryService
+from app.services.cron_match import normalize_cron_or_default
 from app.services.routines import RoutineService, now_in_user_tz
 
 logger = logging.getLogger(__name__)
@@ -19,6 +20,9 @@ async def run_routine_generation(
     routines_repo: RoutineTemplateRepository,
     task_events: TaskEventRepository,
     trello: TrelloClient,
+    *,
+    tick_minutes: int = 10,
+    default_routine_cron: str = "0 8 * * *",
 ) -> None:
     session = profile_repo.session
     users_result = await session.execute(select(UserProfile))
@@ -35,8 +39,30 @@ async def run_routine_generation(
         service = RoutineService(routines_repo, user_trello)
         category_service = CategoryService(user_trello)
         now_local = now_in_user_tz(profile, fallback_tz="Europe/Moscow")
+        profile_cron, profile_fallback = normalize_cron_or_default(profile.routine_cron, default_routine_cron)
+        if profile_fallback:
+            logger.warning(
+                "invalid profile routine_cron for user=%s: %r, fallback=%r",
+                profile.telegram_user_id,
+                profile.routine_cron,
+                profile_cron,
+            )
         for template in templates:
-            if not service.should_run_template(template, now_local):
+            template_cron, template_fallback = normalize_cron_or_default(template.schedule_cron, profile_cron)
+            if template_fallback:
+                logger.warning(
+                    "invalid template cron for user=%s template=%s: %r, fallback=%r",
+                    profile.telegram_user_id,
+                    template.name,
+                    template.schedule_cron,
+                    template_cron,
+                )
+            if not service.should_run_template(
+                template,
+                now_local,
+                window_minutes=tick_minutes,
+                effective_cron=template_cron,
+            ):
                 continue
             card = await service.generate_card_for_template(
                 profile=profile,

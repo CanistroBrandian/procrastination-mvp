@@ -234,6 +234,40 @@ def test_clarification_resume_for_create_card_completes_creation():
     assert profile.telegram_user_id not in repo.store
 
 
+def test_create_card_clarification_abort_voice_phrase_does_not_call_llm():
+    """После уточнения срока: «не надо ставить задачу» — отмена без второго вызова агента."""
+    agent = FakeAgent(
+        [
+            AgentResult(
+                action=AgentAction(action_type="create_card", card_name="Что-то"),
+                response_text="Уточню",
+            ),
+        ],
+    )
+    trello = FakeTrello()
+    repo = FakeClarificationRepo()
+    orch = _make_orch(agent, trello, repo)
+    profile = FakeProfile()
+
+    _run(orch.process_text(profile, "поставь задачу"))
+    assert trello.calls == []
+
+    out = _run(orch.process_text(profile, "Не надо ставить задачу."))
+    assert "отмен" in out.text.lower()
+    assert trello.calls == []
+    assert agent.received_texts == ["поставь задачу"]
+    assert profile.telegram_user_id not in repo.store
+
+
+def test_abort_create_card_phrases():
+    from app.services.orchestrator import TaskOrchestrator
+
+    assert TaskOrchestrator._looks_like_abort_create_card_clarification("Не надо ставить задачу.")
+    assert TaskOrchestrator._looks_like_abort_create_card_clarification("отмена")
+    assert TaskOrchestrator._looks_like_abort_create_card_clarification("нет")
+    assert not TaskOrchestrator._looks_like_abort_create_card_clarification("13 мая в 12:00")
+
+
 def test_pure_checklist_request_without_card_id_asks_for_card():
     agent = FakeAgent([
         AgentResult(

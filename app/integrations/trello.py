@@ -108,6 +108,13 @@ class TrelloClient:
             {"fields": "name,color"},
         )
 
+    async def list_board_members(self, board_id: str) -> list[dict[str, Any]]:
+        return await self._request(
+            "GET",
+            f"/boards/{board_id}/members",
+            {"fields": "fullName,username,initials"},
+        )
+
     async def create_board_label(self, board_id: str, name: str, color: str = "blue") -> dict[str, Any]:
         return await self._request(
             "POST",
@@ -156,7 +163,7 @@ class TrelloClient:
         return await self._request(
             "GET",
             f"/cards/{card_id}",
-            {"fields": "name,desc,idList,closed,shortUrl,idLabels"},
+            {"fields": "name,desc,idList,closed,shortUrl,idLabels,due,dueComplete"},
         )
 
     async def list_card_checklists(self, card_id: str) -> list[dict[str, Any]]:
@@ -168,6 +175,13 @@ class TrelloClient:
                 "checkItems": "all",
                 "checkItem_fields": "all",
             },
+        )
+
+    async def list_card_attachments(self, card_id: str) -> list[dict[str, Any]]:
+        return await self._request(
+            "GET",
+            f"/cards/{card_id}/attachments",
+            {"fields": "name,url,isUpload,fileName,mimeType"},
         )
 
     async def create_card(
